@@ -204,11 +204,24 @@ dotctl uses a `dotctl.yaml` file in your dotfiles directory. This file is automa
 # This file defines your dotfiles packages and their target systems
 
 packages:
+  # Simple system assignments
   nvim: all           # Neovim config for all systems
   tmux: macos         # tmux only on macOS
   bat: all            # bat config for all systems  
   shell: all          # Shell configs for all systems
   .oh-my-zsh: all     # Oh My Zsh for all systems
+  
+  # Multiple systems assignment
+  git:                # Git config for specific systems
+    systems:
+      - linux
+      - macos
+    description: "Git configuration files"
+  
+  hyprland:           # Hyprland only on Arch
+    systems:
+      - arch
+    description: "Hyprland window manager config"
 
 # Files and directories to exclude from all packages
 global_excludes:
