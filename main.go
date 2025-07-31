@@ -39,11 +39,21 @@ type DotfilesManager struct {
 
 func NewDotfilesManager(dotfilesDir string) (*DotfilesManager, error) {
 	if dotfilesDir == "" {
-		usr, err := user.Current()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get current user: %w", err)
+		// First, check if we're already in a dotfiles directory (contains dotctl.json)
+		if cwd, err := os.Getwd(); err == nil {
+			if _, err := os.Stat(filepath.Join(cwd, "dotctl.json")); err == nil {
+				dotfilesDir = cwd
+			}
 		}
-		dotfilesDir = filepath.Join(usr.HomeDir, ".dotfiles")
+
+		// If not found in current directory, use default location
+		if dotfilesDir == "" {
+			usr, err := user.Current()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get current user: %w", err)
+			}
+			dotfilesDir = filepath.Join(usr.HomeDir, ".dotfiles")
+		}
 	}
 
 	manager := &DotfilesManager{
