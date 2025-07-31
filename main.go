@@ -149,6 +149,10 @@ func (dm *DotfilesManager) loadConfig() (*Config, error) {
 		config.StowOptions = defaultConfig.StowOptions
 	}
 
+	// Always ensure the target directory in stow options matches the current user's home directory
+	// This fixes issues when moving configs between different systems (macOS vs Linux)
+	config.StowOptions = updateStowTargetOption(config.StowOptions, usr.HomeDir)
+
 	return &config, nil
 }
 
@@ -810,6 +814,28 @@ func boolToCheckmark(b bool) string {
 		return "✓"
 	}
 	return "✗"
+}
+
+func updateStowTargetOption(stowOptions []string, homeDir string) []string {
+	var updatedOptions []string
+	targetFound := false
+
+	for _, option := range stowOptions {
+		if strings.HasPrefix(option, "--target=") {
+			// Replace with current home directory
+			updatedOptions = append(updatedOptions, "--target="+homeDir)
+			targetFound = true
+		} else {
+			updatedOptions = append(updatedOptions, option)
+		}
+	}
+
+	// If no target option was found, add it
+	if !targetFound {
+		updatedOptions = append(updatedOptions, "--target="+homeDir)
+	}
+
+	return updatedOptions
 }
 
 func printUsage() {
