@@ -107,8 +107,8 @@ func (dm *DotfilesManager) loadConfig() (*Config, error) {
 	}
 
 	if _, err := os.Stat(dm.ConfigFile); os.IsNotExist(err) {
-		fmt.Printf("Creating default config at %s\n", dm.ConfigFile)
-		return defaultConfig, dm.saveConfig(defaultConfig)
+		// Don't create config automatically - let init command handle it
+		return defaultConfig, nil
 	}
 
 	data, err := os.ReadFile(dm.ConfigFile)
@@ -231,8 +231,24 @@ func (dm *DotfilesManager) scanPackages() ([]string, error) {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && entry.Name() != "__pycache__" {
-			packages = append(packages, entry.Name())
+		name := entry.Name()
+		// Skip git directory, config files, and cache directories
+		if name == ".git" || name == "dotctl.json" || name == "__pycache__" || strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+
+		// Include directories (both regular and dotfiles)
+		if entry.IsDir() {
+			// Special handling for .config directory - scan its subdirectories as individual packages
+			if name == ".config" {
+				configPackages, err := dm.scanConfigPackages()
+				if err != nil {
+					return nil, fmt.Errorf("failed to scan .config packages: %w", err)
+				}
+				packages = append(packages, configPackages...)
+			} else {
+				packages = append(packages, name)
+			}
 		}
 	}
 
@@ -240,10 +256,49 @@ func (dm *DotfilesManager) scanPackages() ([]string, error) {
 	return packages, nil
 }
 
+func (dm *DotfilesManager) scanConfigPackages() ([]string, error) {
+	var packages []string
+	configDir := filepath.Join(dm.DotfilesDir, ".config")
+
+	entries, err := os.ReadDir(configDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read .config directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		// Skip hidden files and common non-package items
+		if strings.HasPrefix(name, ".") || name == "__pycache__" || strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+
+		// Include directories as config packages with .config/ prefix
+		if entry.IsDir() {
+			packages = append(packages, ".config/"+name)
+		}
+	}
+
+	return packages, nil
+}
+
 func (dm *DotfilesManager) deployPackage(packageName string, dryRun bool) error {
-	packageDir := filepath.Join(dm.DotfilesDir, packageName)
+	var packageDir string
+	var stowPackageName string
+
+	// Handle .config packages specially
+	if strings.HasPrefix(packageName, ".config/") {
+		// For .config packages, we need to stow from the .config directory
+		// but only the specific subdirectory
+		configSubdir := strings.TrimPrefix(packageName, ".config/")
+		packageDir = filepath.Join(dm.DotfilesDir, ".config", configSubdir)
+		stowPackageName = configSubdir
+	} else {
+		packageDir = filepath.Join(dm.DotfilesDir, packageName)
+		stowPackageName = packageName
+	}
+
 	if _, err := os.Stat(packageDir); os.IsNotExist(err) {
-		return fmt.Errorf("package '%s' not found in %s", packageName, dm.DotfilesDir)
+		return fmt.Errorf("package '%s' not found at %s", packageName, packageDir)
 	}
 
 	if !dm.isStowAvailable() {
@@ -256,7 +311,7 @@ func (dm *DotfilesManager) deployPackage(packageName string, dryRun bool) error 
 	// Build stow command
 	args := []string{"stow"}
 	args = append(args, dm.Config.StowOptions...)
-	args = append(args, packageName)
+	args = append(args, stowPackageName)
 
 	if dryRun {
 		args = append(args, "--no")
@@ -266,7 +321,14 @@ func (dm *DotfilesManager) deployPackage(packageName string, dryRun bool) error 
 	}
 
 	cmd := exec.Command("stow", args[1:]...)
-	cmd.Dir = dm.DotfilesDir
+
+	// Set working directory based on package type
+	if strings.HasPrefix(packageName, ".config/") {
+		cmd.Dir = filepath.Join(dm.DotfilesDir, ".config")
+	} else {
+		cmd.Dir = dm.DotfilesDir
+	}
+
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -288,9 +350,18 @@ func (dm *DotfilesManager) undeployPackage(packageName string, dryRun bool) erro
 		return fmt.Errorf("GNU stow is not available")
 	}
 
+	var stowPackageName string
+
+	// Handle .config packages specially
+	if strings.HasPrefix(packageName, ".config/") {
+		stowPackageName = strings.TrimPrefix(packageName, ".config/")
+	} else {
+		stowPackageName = packageName
+	}
+
 	args := []string{"--delete"}
 	args = append(args, dm.Config.StowOptions...)
-	args = append(args, packageName)
+	args = append(args, stowPackageName)
 
 	if dryRun {
 		args = append(args, "--no")
@@ -300,7 +371,14 @@ func (dm *DotfilesManager) undeployPackage(packageName string, dryRun bool) erro
 	}
 
 	cmd := exec.Command("stow", args...)
-	cmd.Dir = dm.DotfilesDir
+
+	// Set working directory based on package type
+	if strings.HasPrefix(packageName, ".config/") {
+		cmd.Dir = filepath.Join(dm.DotfilesDir, ".config")
+	} else {
+		cmd.Dir = dm.DotfilesDir
+	}
+
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -321,6 +399,8 @@ func (dm *DotfilesManager) deployAll(packages []string, dryRun bool) {
 
 	if len(packages) == 0 {
 		fmt.Printf("No packages configured for system '%s'\n", dm.System)
+		fmt.Printf("\nTo diagnose this issue, run: dotctl debug\n")
+		fmt.Printf("Or check your configuration with: dotctl status\n")
 		return
 	}
 
@@ -471,7 +551,7 @@ func (dm *DotfilesManager) initializeConfig(dryRun bool) error {
 	// Check if config already exists
 	if _, err := os.Stat(dm.ConfigFile); err == nil {
 		fmt.Printf("Configuration file already exists at %s\n", dm.ConfigFile)
-		fmt.Println("Use --force to overwrite existing configuration")
+		fmt.Println("Run 'dotctl status' to see current configuration")
 		return nil
 	}
 
@@ -498,6 +578,10 @@ func (dm *DotfilesManager) initializeConfig(dryRun bool) error {
 		Packages:       make(map[string]interface{}),
 		GlobalExcludes: []string{".git", ".DS_Store", "*.pyc", "__pycache__"},
 		StowOptions:    []string{"--verbose"},
+		GitHub: &GitHubConfig{
+			Repository: "username/dotfiles", // Replace with your GitHub repository
+			Branch:     "main",
+		},
 	}
 
 	// Set target directory
@@ -863,6 +947,26 @@ func main() {
 		if err := manager.pullFromGitHub(dryRun); err != nil {
 			fmt.Printf("Error pulling from GitHub: %v\n", err)
 			os.Exit(1)
+		}
+
+	case "debug":
+		// Debug command to test package filtering
+		fmt.Printf("Current system: %s\n", manager.System)
+		fmt.Printf("Total packages in config: %d\n", len(manager.Config.Packages))
+		fmt.Println("\nPackage analysis:")
+		for pkgName, pkgConfig := range manager.Config.Packages {
+			deployable := shouldDeployPackage(pkgConfig, manager.System)
+			fmt.Printf("  %s: %+v -> deployable for %s: %t\n", pkgName, pkgConfig, manager.System, deployable)
+		}
+
+		// Test with different systems
+		testSystems := []string{"arch", "linux", "macos", "ubuntu"}
+		for _, testSys := range testSystems {
+			packages := manager.getPackagesForSystem(testSys)
+			fmt.Printf("\nPackages for %s: %d packages\n", testSys, len(packages))
+			if len(packages) > 0 {
+				fmt.Printf("  %s\n", strings.Join(packages, ", "))
+			}
 		}
 
 	default:
