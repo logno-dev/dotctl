@@ -41,8 +41,10 @@ func NewDotfilesManager(dotfilesDir string) (*DotfilesManager, error) {
 	if dotfilesDir == "" {
 		// First, check if we're already in a dotfiles directory (contains dotctl.json)
 		if cwd, err := os.Getwd(); err == nil {
-			if _, err := os.Stat(filepath.Join(cwd, "dotctl.json")); err == nil {
+			configPath := filepath.Join(cwd, "dotctl.json")
+			if _, err := os.Stat(configPath); err == nil {
 				dotfilesDir = cwd
+				fmt.Printf("Debug: Found dotctl.json in current directory: %s\n", configPath)
 			}
 		}
 
@@ -53,9 +55,11 @@ func NewDotfilesManager(dotfilesDir string) (*DotfilesManager, error) {
 				return nil, fmt.Errorf("failed to get current user: %w", err)
 			}
 			dotfilesDir = filepath.Join(usr.HomeDir, ".dotfiles")
+			fmt.Printf("Debug: Using default dotfiles directory: %s\n", dotfilesDir)
 		}
+	} else {
+		fmt.Printf("Debug: Using specified dotfiles directory: %s\n", dotfilesDir)
 	}
-
 	manager := &DotfilesManager{
 		DotfilesDir: dotfilesDir,
 		ConfigFile:  filepath.Join(dotfilesDir, "dotctl.json"),
@@ -123,12 +127,14 @@ func (dm *DotfilesManager) loadConfig() (*Config, error) {
 
 	data, err := os.ReadFile(dm.ConfigFile)
 	if err != nil {
+		fmt.Printf("Warning: Could not read config file %s: %v\n", dm.ConfigFile, err)
 		return defaultConfig, nil
 	}
 
 	var config Config
 	if err := json.Unmarshal(data, &config); err != nil {
 		fmt.Printf("Error parsing config: %v\n", err)
+		fmt.Printf("Config file content: %s\n", string(data))
 		return defaultConfig, nil
 	}
 
@@ -960,25 +966,81 @@ func main() {
 		}
 
 	case "debug":
-		// Debug command to test package filtering
-		fmt.Printf("Current system: %s\n", manager.System)
-		fmt.Printf("Total packages in config: %d\n", len(manager.Config.Packages))
-		fmt.Println("\nPackage analysis:")
-		for pkgName, pkgConfig := range manager.Config.Packages {
-			deployable := shouldDeployPackage(pkgConfig, manager.System)
-			fmt.Printf("  %s: %+v -> deployable for %s: %t\n", pkgName, pkgConfig, manager.System, deployable)
+		// Debug command to test package filtering and filesystem operations
+		fmt.Printf("=== FILESYSTEM DEBUG ===\n")
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Printf("Error getting current directory: %v\n", err)
+		} else {
+			fmt.Printf("Current working directory: %s\n", cwd)
 		}
 
-		// Test with different systems
-		testSystems := []string{"arch", "linux", "macos", "ubuntu"}
-		for _, testSys := range testSystems {
-			packages := manager.getPackagesForSystem(testSys)
-			fmt.Printf("\nPackages for %s: %d packages\n", testSys, len(packages))
-			if len(packages) > 0 {
-				fmt.Printf("  %s\n", strings.Join(packages, ", "))
+		fmt.Printf("Dotfiles directory: %s\n", manager.DotfilesDir)
+		fmt.Printf("Config file path: %s\n", manager.ConfigFile)
+
+		// Check if dotfiles directory exists
+		if stat, err := os.Stat(manager.DotfilesDir); err != nil {
+			fmt.Printf("Dotfiles directory error: %v\n", err)
+		} else {
+			fmt.Printf("Dotfiles directory exists: %t, is dir: %t\n", true, stat.IsDir())
+		}
+
+		// Check if config file exists
+		if stat, err := os.Stat(manager.ConfigFile); err != nil {
+			fmt.Printf("Config file error: %v\n", err)
+		} else {
+			fmt.Printf("Config file exists: %t, size: %d bytes\n", true, stat.Size())
+		}
+
+		// Try to read config file directly
+		if data, err := os.ReadFile(manager.ConfigFile); err != nil {
+			fmt.Printf("Error reading config file: %v\n", err)
+		} else {
+			fmt.Printf("Config file content length: %d bytes\n", len(data))
+			if len(data) > 0 {
+				previewLen := 200
+				if len(data) < previewLen {
+					previewLen = len(data)
+				}
+				fmt.Printf("Config file preview (first %d chars): %s\n", previewLen, string(data[:previewLen]))
 			}
 		}
 
+		fmt.Printf("\n=== SYSTEM DETECTION ===\n")
+		fmt.Printf("Runtime GOOS: %s\n", runtime.GOOS)
+		fmt.Printf("Detected system: %s\n", manager.System)
+
+		// Check /etc/os-release on Linux systems
+		if runtime.GOOS == "linux" {
+			if data, err := os.ReadFile("/etc/os-release"); err != nil {
+				fmt.Printf("Error reading /etc/os-release: %v\n", err)
+			} else {
+				fmt.Printf("/etc/os-release content:\n%s\n", string(data))
+			}
+		}
+
+		fmt.Printf("\n=== PACKAGE ANALYSIS ===\n")
+		fmt.Printf("Total packages in config: %d\n", len(manager.Config.Packages))
+
+		if len(manager.Config.Packages) > 0 {
+			fmt.Println("\nPackage analysis:")
+			for pkgName, pkgConfig := range manager.Config.Packages {
+				deployable := shouldDeployPackage(pkgConfig, manager.System)
+				fmt.Printf("  %s: %+v -> deployable for %s: %t\n", pkgName, pkgConfig, manager.System, deployable)
+			}
+
+			// Test with different systems
+			testSystems := []string{"arch", "linux", "macos", "ubuntu"}
+			for _, testSys := range testSystems {
+				packages := manager.getPackagesForSystem(testSys)
+				fmt.Printf("\nPackages for %s: %d packages\n", testSys, len(packages))
+				if len(packages) > 0 {
+					fmt.Printf("  %s\n", strings.Join(packages, ", "))
+				}
+			}
+		} else {
+			fmt.Println("No packages found in configuration - this suggests config loading failed")
+		}
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
 		printUsage()
