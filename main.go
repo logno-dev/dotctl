@@ -339,6 +339,11 @@ func (dm *DotfilesManager) deployPackage(packageName string, dryRun bool) error 
 		}
 	}
 
+	// Check if package contains templates
+	if err := dm.processPackageTemplates(packageDir, dryRun); err != nil {
+		return fmt.Errorf("failed to process templates in %s: %w", packageName, err)
+	}
+
 	// Create the symlink
 	relativePackageDir, err := filepath.Rel(targetDir, packageDir)
 	if err != nil {
@@ -758,6 +763,109 @@ func isKnownSystem(name string) bool {
 	}
 	return false
 }
+
+func (dm *DotfilesManager) processTemplate(templatePath, outputPath string) error {
+	// Read template file
+	templateContent, err := os.ReadFile(templatePath)
+	if err != nil {
+		return fmt.Errorf("failed to read template file: %w", err)
+	}
+
+	// Process template with current system
+	processedContent := dm.processTemplateContent(string(templateContent))
+
+	// Write processed content to output file
+	if err := os.WriteFile(outputPath, []byte(processedContent), 0644); err != nil {
+		return fmt.Errorf("failed to write processed template: %w", err)
+	}
+
+	return nil
+}
+
+func (dm *DotfilesManager) processTemplateContent(content string) string {
+	// Simple template processing for {{#if system}} blocks
+	lines := strings.Split(content, "\n")
+	var result []string
+	var skipBlock bool
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Check for {{#if system}} blocks
+		if strings.HasPrefix(trimmed, "{{#if ") && strings.HasSuffix(trimmed, "}}") {
+			// Extract condition
+			condition := strings.TrimSpace(trimmed[6 : len(trimmed)-2])
+
+			// Check if condition matches current system
+			skipBlock = !dm.matchesCondition(condition)
+			continue
+		}
+
+		// Check for {{/if}} end blocks
+		if trimmed == "{{/if}}" {
+			skipBlock = false
+			continue
+		}
+		// Add line if not in a skipped block
+		if !skipBlock {
+			result = append(result, line)
+		}
+	}
+
+	return strings.Join(result, "\n")
+}
+
+func (dm *DotfilesManager) matchesCondition(condition string) bool {
+	switch condition {
+	case "macos":
+		return dm.System == "macos"
+	case "linux":
+		return dm.System == "arch" || dm.System == "ubuntu" || dm.System == "debian" || dm.System == "fedora" || dm.System == "linux"
+	case "arch":
+		return dm.System == "arch"
+	case "ubuntu":
+		return dm.System == "ubuntu"
+	case "debian":
+		return dm.System == "debian"
+	case "fedora":
+		return dm.System == "fedora"
+	default:
+		return dm.System == condition
+	}
+}
+
+func (dm *DotfilesManager) processPackageTemplates(packageDir string, dryRun bool) error {
+	// Walk through package directory and process any .template files
+	return filepath.Walk(packageDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Check if this is a template file
+		if strings.HasSuffix(info.Name(), ".template") {
+			outputPath := strings.TrimSuffix(path, ".template")
+
+			if dryRun {
+				fmt.Printf("DRY RUN: Would process template %s -> %s\n", path, outputPath)
+				return nil
+			}
+
+			// Process the template
+			if err := dm.processTemplate(path, outputPath); err != nil {
+				return fmt.Errorf("failed to process template %s: %w", path, err)
+			}
+
+			fmt.Printf("TEMPLATE: %s -> %s\n", path, outputPath)
+		}
+
+		return nil
+	})
+}
 func (dm *DotfilesManager) initializeConfig(dryRun bool) error {
 	// Check if config already exists
 	if _, err := os.Stat(dm.ConfigFile); err == nil {
@@ -882,39 +990,103 @@ func (dm *DotfilesManager) syncToGitHub(dryRun bool) error {
 	}
 
 	if dryRun {
+		fmt.Printf("DRY RUN: Would fetch from upstream\n")
+		fmt.Printf("DRY RUN: Would check for local changes\n")
+		fmt.Printf("DRY RUN: Would stash local changes if needed\n")
+		fmt.Printf("DRY RUN: Would pull upstream changes\n")
+		fmt.Printf("DRY RUN: Would restore local changes and merge\n")
 		fmt.Printf("DRY RUN: Would add all files to git\n")
 		fmt.Printf("DRY RUN: Would commit changes\n")
 		fmt.Printf("DRY RUN: Would push to %s:%s\n", dm.Config.GitHub.Repository, branch)
 		return nil
 	}
 
-	fmt.Printf("Syncing to GitHub repository %s...\n", dm.Config.GitHub.Repository)
+	fmt.Printf("Syncing with GitHub repository %s...\n", dm.Config.GitHub.Repository)
 
-	// Add all files
+	// Step 1: Fetch upstream changes to check if we're behind
+	fmt.Printf("Fetching upstream changes...\n")
+	if err := dm.runGitCommand("fetch", "origin", branch); err != nil {
+		return fmt.Errorf("failed to fetch from upstream: %w", err)
+	}
+
+	// Step 2: Check if we have local changes
+	hasLocalChanges, err := dm.hasLocalChanges()
+	if err != nil {
+		return fmt.Errorf("failed to check for local changes: %w", err)
+	}
+
+	// Step 3: Check if we're behind upstream
+	isBehind, err := dm.isBehindUpstream(branch)
+	if err != nil {
+		return fmt.Errorf("failed to check upstream status: %w", err)
+	}
+
+	var stashCreated bool
+
+	// Step 4: If we have local changes and need to pull, stash them
+	if hasLocalChanges && isBehind {
+		fmt.Printf("Local changes detected, stashing before pull...\n")
+		if err := dm.runGitCommand("stash", "push", "-m", "dotctl-sync-stash-"+getCurrentTimestamp()); err != nil {
+			return fmt.Errorf("failed to stash local changes: %w", err)
+		}
+		stashCreated = true
+	}
+
+	// Step 5: Pull upstream changes if we're behind
+	if isBehind {
+		fmt.Printf("Pulling upstream changes...\n")
+		if err := dm.runGitCommand("pull", "origin", branch); err != nil {
+			// If pull failed and we stashed, try to restore
+			if stashCreated {
+				fmt.Printf("Pull failed, restoring stashed changes...\n")
+				dm.runGitCommand("stash", "pop")
+			}
+			return fmt.Errorf("failed to pull from upstream: %w", err)
+		}
+		fmt.Printf("✓ Successfully pulled upstream changes\n")
+	}
+
+	// Step 6: If we stashed changes, restore them and handle conflicts
+	if stashCreated {
+		fmt.Printf("Restoring local changes...\n")
+		if err := dm.runGitCommand("stash", "pop"); err != nil {
+			// Check if it's a merge conflict
+			if dm.hasMergeConflicts() {
+				fmt.Printf("⚠️  Merge conflicts detected after restoring local changes.\n")
+				fmt.Printf("Please resolve conflicts manually and run 'dotctl sync' again.\n")
+				fmt.Printf("Conflicted files can be found with: git status\n")
+				return fmt.Errorf("merge conflicts detected - manual resolution required")
+			}
+			return fmt.Errorf("failed to restore stashed changes: %w", err)
+		}
+		fmt.Printf("✓ Successfully restored local changes\n")
+	}
+
+	// Step 7: Add all files (including any resolved conflicts or new changes)
 	if err := dm.runGitCommand("add", "."); err != nil {
 		return fmt.Errorf("failed to add files: %w", err)
 	}
 
-	// Check if there are changes to commit
+	// Step 8: Check if there are changes to commit
 	cmd := exec.Command("git", "diff", "--cached", "--quiet")
 	cmd.Dir = dm.DotfilesDir
 	if err := cmd.Run(); err == nil {
-		fmt.Println("No changes to commit")
+		fmt.Println("✓ Repository is up to date, no changes to sync")
 		return nil
 	}
 
-	// Commit changes
+	// Step 9: Commit changes
 	commitMsg := fmt.Sprintf("Update dotfiles - %s", getCurrentTimestamp())
 	if err := dm.runGitCommand("commit", "-m", commitMsg); err != nil {
 		return fmt.Errorf("failed to commit changes: %w", err)
 	}
 
-	// Push to GitHub
-	if err := dm.runGitCommand("push", "-u", "origin", branch); err != nil {
+	// Step 10: Push to GitHub
+	if err := dm.runGitCommand("push", "origin", branch); err != nil {
 		return fmt.Errorf("failed to push to GitHub: %w", err)
 	}
 
-	fmt.Printf("✓ Successfully synced to GitHub repository %s\n", dm.Config.GitHub.Repository)
+	fmt.Printf("✓ Successfully synced with GitHub repository %s\n", dm.Config.GitHub.Repository)
 	return nil
 }
 
@@ -986,6 +1158,75 @@ func (dm *DotfilesManager) runGitCommand(args ...string) error {
 	return nil
 }
 
+// hasLocalChanges checks if there are uncommitted changes in the working directory
+func (dm *DotfilesManager) hasLocalChanges() (bool, error) {
+	// Check for staged changes
+	cmd := exec.Command("git", "diff", "--cached", "--quiet")
+	cmd.Dir = dm.DotfilesDir
+	if err := cmd.Run(); err != nil {
+		// Exit code 1 means there are staged changes
+		if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
+			return true, nil
+		}
+		return false, fmt.Errorf("failed to check staged changes: %w", err)
+	}
+
+	// Check for unstaged changes
+	cmd = exec.Command("git", "diff", "--quiet")
+	cmd.Dir = dm.DotfilesDir
+	if err := cmd.Run(); err != nil {
+		// Exit code 1 means there are unstaged changes
+		if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
+			return true, nil
+		}
+		return false, fmt.Errorf("failed to check unstaged changes: %w", err)
+	}
+
+	// Check for untracked files
+	cmd = exec.Command("git", "ls-files", "--others", "--exclude-standard")
+	cmd.Dir = dm.DotfilesDir
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to check untracked files: %w", err)
+	}
+
+	return len(strings.TrimSpace(string(output))) > 0, nil
+}
+
+// isBehindUpstream checks if the local branch is behind the upstream branch
+func (dm *DotfilesManager) isBehindUpstream(branch string) (bool, error) {
+	// Get the commit hash of the local branch
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = dm.DotfilesDir
+	localOutput, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to get local commit hash: %w", err)
+	}
+	localHash := strings.TrimSpace(string(localOutput))
+
+	// Get the commit hash of the upstream branch
+	cmd = exec.Command("git", "rev-parse", "origin/"+branch)
+	cmd.Dir = dm.DotfilesDir
+	upstreamOutput, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to get upstream commit hash: %w", err)
+	}
+	upstreamHash := strings.TrimSpace(string(upstreamOutput))
+
+	return localHash != upstreamHash, nil
+}
+
+// hasMergeConflicts checks if there are merge conflicts in the working directory
+func (dm *DotfilesManager) hasMergeConflicts() bool {
+	cmd := exec.Command("git", "diff", "--name-only", "--diff-filter=U")
+	cmd.Dir = dm.DotfilesDir
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return len(strings.TrimSpace(string(output))) > 0
+}
+
 func getCurrentTimestamp() string {
 	return time.Now().Format("2006-01-02 15:04:05")
 }
@@ -1020,34 +1261,67 @@ func (dm *DotfilesManager) deployShellPackage(packageDir, homeDir string, dryRun
 	}
 
 	for _, entry := range entries {
-		sourcePath := filepath.Join(packageDir, entry.Name())
-		targetPath := filepath.Join(homeDir, entry.Name())
-
-		if dryRun {
-			fmt.Printf("DRY RUN: Would create symlink %s -> %s\n", targetPath, sourcePath)
-			continue
+		if entry.IsDir() {
+			continue // Skip directories in shell package
 		}
 
-		// Check if target already exists
-		if _, err := os.Lstat(targetPath); err == nil {
-			// Remove existing symlink or file
-			if err := os.Remove(targetPath); err != nil {
-				return fmt.Errorf("failed to remove existing %s: %w", targetPath, err)
+		fileName := entry.Name()
+		sourcePath := filepath.Join(packageDir, fileName)
+
+		// Check if this is a template file
+		if strings.HasSuffix(fileName, ".template") {
+			// Process template
+			outputFileName := strings.TrimSuffix(fileName, ".template")
+			targetPath := filepath.Join(homeDir, outputFileName)
+
+			if dryRun {
+				fmt.Printf("DRY RUN: Would process template %s -> %s\n", sourcePath, targetPath)
+				continue
 			}
-		}
 
-		// Create relative path for symlink
-		relativeSourcePath, err := filepath.Rel(homeDir, sourcePath)
-		if err != nil {
-			return fmt.Errorf("failed to calculate relative path: %w", err)
-		}
+			// Remove existing file
+			if _, err := os.Lstat(targetPath); err == nil {
+				if err := os.Remove(targetPath); err != nil {
+					return fmt.Errorf("failed to remove existing %s: %w", targetPath, err)
+				}
+			}
 
-		// Create the symlink
-		if err := os.Symlink(relativeSourcePath, targetPath); err != nil {
-			return fmt.Errorf("failed to create symlink %s -> %s: %w", targetPath, relativeSourcePath, err)
-		}
+			// Process template
+			if err := dm.processTemplate(sourcePath, targetPath); err != nil {
+				return fmt.Errorf("failed to process template %s: %w", fileName, err)
+			}
 
-		fmt.Printf("LINK: %s -> %s\n", targetPath, relativeSourcePath)
+			fmt.Printf("TEMPLATE: %s -> %s\n", sourcePath, targetPath)
+		} else {
+			// Regular file - create symlink
+			targetPath := filepath.Join(homeDir, fileName)
+
+			if dryRun {
+				fmt.Printf("DRY RUN: Would create symlink %s -> %s\n", targetPath, sourcePath)
+				continue
+			}
+
+			// Check if target already exists
+			if _, err := os.Lstat(targetPath); err == nil {
+				// Remove existing symlink or file
+				if err := os.Remove(targetPath); err != nil {
+					return fmt.Errorf("failed to remove existing %s: %w", targetPath, err)
+				}
+			}
+
+			// Create relative path for symlink
+			relativeSourcePath, err := filepath.Rel(homeDir, sourcePath)
+			if err != nil {
+				return fmt.Errorf("failed to calculate relative path: %w", err)
+			}
+
+			// Create the symlink
+			if err := os.Symlink(relativeSourcePath, targetPath); err != nil {
+				return fmt.Errorf("failed to create symlink %s -> %s: %w", targetPath, relativeSourcePath, err)
+			}
+
+			fmt.Printf("LINK: %s -> %s\n", targetPath, relativeSourcePath)
+		}
 	}
 
 	return nil

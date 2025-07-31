@@ -5,6 +5,7 @@ A system-aware dotfiles manager built in Go with native symlink management.
 ## Features
 
 - **System-aware deployment**: Configure packages for specific operating systems (Linux, macOS, Arch, Ubuntu, etc.)
+- **Template system**: Create system-specific configurations with conditional blocks
 - **Native symlink management**: No external dependencies - uses Go's built-in symlink functionality
 - **GitHub integration**: Sync your dotfiles to/from GitHub repositories using GitHub CLI
 - **Zero dependencies**: Built with Go standard library only - no need to install GNU Stow
@@ -230,6 +231,122 @@ dotctl uses a `dotctl.json` file in your dotfiles directory. This file is automa
 - `debian` - Debian
 - `fedora` - Fedora
 
+## Template System
+
+dotctl supports a powerful template system that allows you to create system-specific configurations while maintaining a single source file. This is perfect for configs that need minor differences between operating systems.
+
+### How Templates Work
+
+1. **Create template files** with a `.template` extension
+2. **Use conditional blocks** to include system-specific content
+3. **Deploy normally** - dotctl automatically processes templates during deployment
+
+### Template Syntax
+
+Use conditional blocks to include content for specific systems:
+
+```bash
+{{#if macos}}
+# macOS-specific content
+export PATH="/opt/homebrew/bin:$PATH"
+eval "$(/opt/homebrew/bin/brew shellenv)"
+{{/if}}
+
+{{#if arch}}
+# Arch Linux-specific content
+export PATH="/usr/local/bin:$PATH"
+alias pacman='sudo pacman'
+{{/if}}
+
+{{#if linux}}
+# Any Linux distribution
+export EDITOR=nvim
+{{/if}}
+
+# Common content for all systems
+alias ll='ls -alF'
+alias grep='grep --color=auto'
+```
+
+### Template Examples
+
+#### Shell Configuration (`.zshrc.template`)
+
+```bash
+# Path to your oh-my-zsh installation
+export ZSH="$HOME/.oh-my-zsh"
+
+{{#if macos}}
+# macOS-specific paths
+eval "$(/opt/homebrew/bin/brew shellenv)"
+export PATH="/opt/homebrew/bin:$PATH"
+{{/if}}
+
+{{#if arch}}
+# Arch Linux-specific paths
+export PATH="/usr/local/bin:$PATH"
+{{/if}}
+
+# Common configuration
+export EDITOR=nvim
+ZSH_THEME="robbyrussell"
+source $ZSH/oh-my-zsh.sh
+```
+
+#### Tmux Configuration (`tmux.conf.template`)
+
+```bash
+{{#if macos}}
+# macOS: Use Ctrl+x as prefix
+set-option -g prefix C-x
+bind-key C-x send-prefix
+{{/if}}
+
+{{#if arch}}
+# Arch Linux: Use Ctrl+d as prefix  
+set-option -g prefix C-d
+bind-key C-d send-prefix
+{{/if}}
+
+# Common tmux settings
+unbind C-b
+set -s escape-time 0
+bind | split-window -h
+bind - split-window -v
+```
+
+### Using Templates
+
+```bash
+# Create your template files
+~/.dotfiles/shell/.zshrc.template
+~/.dotfiles/tmux/tmux.conf.template
+
+# Deploy packages - templates are processed automatically
+dotctl deploy shell tmux
+
+# Results in system-specific configs:
+# ~/.zshrc (with Arch-specific paths on Arch, macOS paths on macOS)
+# ~/.config/tmux/tmux.conf (with Ctrl+d on Arch, Ctrl+x on macOS)
+```
+
+### Available Conditions
+
+- `{{#if macos}}` - macOS only
+- `{{#if linux}}` - Any Linux distribution
+- `{{#if arch}}` - Arch Linux only
+- `{{#if ubuntu}}` - Ubuntu only
+- `{{#if debian}}` - Debian only
+- `{{#if fedora}}` - Fedora only
+
+### Template Benefits
+
+- **Single source of truth**: One template file instead of multiple system-specific files
+- **Automatic processing**: Templates processed during deployment
+- **System-aware**: Different content for different operating systems
+- **Maintainable**: Easy to add new systems or modify shared content
+- **Flexible**: Works with any text-based configuration file
+
 ## Adopting New Packages
 
 When you install new applications that create config directories in `~/.config/`, you can easily adopt them:
@@ -295,9 +412,15 @@ dotctl can sync your dotfiles to and from GitHub repositories using the GitHub C
 ### How it Works
 
 - If your dotfiles directory isn't a git repository, `dotctl sync` will initialize it and add the GitHub remote
-- `dotctl sync` adds all files, commits with a timestamp, and pushes to the configured repository
+- `dotctl sync` intelligently handles both local and upstream changes:
+  1. **Fetches upstream changes** to check if the remote has updates
+  2. **Stashes local changes** if needed before pulling upstream updates
+  3. **Pulls upstream changes** and merges them with your local repository
+  4. **Restores local changes** and handles any merge conflicts
+  5. **Commits and pushes** your changes to the remote repository
 - `dotctl pull` pulls the latest changes from the configured branch
 - If the dotfiles directory doesn't exist when pulling, it will clone the repository
+- **Merge conflict handling**: If conflicts occur during sync, dotctl will notify you and provide guidance for manual resolution
 
 ## Directory Structure
 
@@ -310,18 +433,22 @@ Your dotfiles directory should be organized like this:
 │   ├── init.lua
 │   └── lua/
 ├── tmux/                # Config package → ~/.config/tmux/
-│   └── tmux.conf
+│   ├── tmux.conf.template    # Template file (processed during deployment)
+│   └── tmux.conf            # Generated from template
 ├── shell/               # Home package → ~/.zshrc, ~/.bashrc
-│   ├── .zshrc
+│   ├── .zshrc.template      # Template file (processed during deployment)
+│   ├── .zshrc               # Generated from template
 │   └── .bashrc
 └── .oh-my-zsh/          # Home package → ~/.oh-my-zsh/
     └── themes/
 ```
 
-When deployed, dotctl creates symlinks:
-- **Config packages**: `~/.config/nvim/` → `../.dotfiles/nvim/`
-- **Shell package**: `~/.zshrc` → `.dotfiles/shell/.zshrc`
-- **Dot packages**: `~/.oh-my-zsh/` → `.dotfiles/.oh-my-zsh/`
+When deployed, dotctl:
+- **Processes templates**: `.template` files → system-specific configs
+- **Creates symlinks**: 
+  - **Config packages**: `~/.config/nvim/` → `../.dotfiles/nvim/`
+  - **Shell package**: `~/.zshrc` → `.dotfiles/shell/.zshrc` (generated from template)
+  - **Dot packages**: `~/.oh-my-zsh/` → `.dotfiles/.oh-my-zsh/`
 
 ## Development
 
