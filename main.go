@@ -117,7 +117,7 @@ func (dm *DotfilesManager) loadConfig() (*Config, error) {
 	defaultConfig := &Config{
 		Packages:       make(map[string]interface{}),
 		GlobalExcludes: []string{".git", ".DS_Store", "*.pyc", "__pycache__"},
-		StowOptions:    []string{"--verbose", "--target=" + usr.HomeDir},
+		StowOptions:    []string{}, // No longer used - kept for config compatibility
 	}
 
 	if _, err := os.Stat(dm.ConfigFile); os.IsNotExist(err) {
@@ -172,11 +172,6 @@ func (dm *DotfilesManager) saveConfig(config *Config) error {
 	}
 
 	return os.WriteFile(dm.ConfigFile, data, 0644)
-}
-
-func (dm *DotfilesManager) isStowAvailable() bool {
-	_, err := exec.LookPath("stow")
-	return err == nil
 }
 
 func (dm *DotfilesManager) isGitHubCLIAvailable() bool {
@@ -259,16 +254,7 @@ func (dm *DotfilesManager) scanPackages() ([]string, error) {
 
 		// Include directories (both regular and dotfiles)
 		if entry.IsDir() {
-			// Special handling for .config directory - scan its subdirectories as individual packages
-			if name == ".config" {
-				configPackages, err := dm.scanConfigPackages()
-				if err != nil {
-					return nil, fmt.Errorf("failed to scan .config packages: %w", err)
-				}
-				packages = append(packages, configPackages...)
-			} else {
-				packages = append(packages, name)
-			}
+			packages = append(packages, name)
 		}
 	}
 
@@ -302,116 +288,116 @@ func (dm *DotfilesManager) scanConfigPackages() ([]string, error) {
 }
 
 func (dm *DotfilesManager) deployPackage(packageName string, dryRun bool) error {
-	var packageDir string
-	var stowPackageName string
-
-	// Handle .config packages specially
-	if strings.HasPrefix(packageName, ".config/") {
-		// For .config packages, we need to stow from the .config directory
-		// but only the specific subdirectory
-		configSubdir := strings.TrimPrefix(packageName, ".config/")
-		packageDir = filepath.Join(dm.DotfilesDir, ".config", configSubdir)
-		stowPackageName = configSubdir
-	} else {
-		packageDir = filepath.Join(dm.DotfilesDir, packageName)
-		stowPackageName = packageName
-	}
+	packageDir := filepath.Join(dm.DotfilesDir, packageName)
 
 	if _, err := os.Stat(packageDir); os.IsNotExist(err) {
 		return fmt.Errorf("package '%s' not found at %s", packageName, packageDir)
 	}
 
-	if !dm.isStowAvailable() {
-		return fmt.Errorf("GNU stow is not available. Please install it first:\n" +
-			"  - On macOS: brew install stow\n" +
-			"  - On Arch: sudo pacman -S stow\n" +
-			"  - On Ubuntu/Debian: sudo apt install stow")
+	// Determine target directory and symlink path
+	usr, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("failed to get current user: %w", err)
 	}
 
-	// Build stow command
-	args := []string{"stow"}
-	args = append(args, dm.Config.StowOptions...)
-	args = append(args, stowPackageName)
+	var targetDir string
+	var symlinkPath string
+
+	if isConfigPackage(packageName) {
+		// Config packages go to ~/.config/PACKAGE_NAME
+		targetDir = filepath.Join(usr.HomeDir, ".config")
+		symlinkPath = filepath.Join(targetDir, packageName)
+	} else {
+		// Home packages: handle special cases
+		if packageName == "shell" {
+			// Shell package contents go directly to home directory
+			return dm.deployShellPackage(packageDir, usr.HomeDir, dryRun)
+		} else {
+			// Other home packages (like .oh-my-zsh) go to ~/PACKAGE_NAME
+			targetDir = usr.HomeDir
+			symlinkPath = filepath.Join(targetDir, packageName)
+		}
+	}
+
+	// Ensure target directory exists
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return fmt.Errorf("failed to create target directory %s: %w", targetDir, err)
+	}
 
 	if dryRun {
-		args = append(args, "--no")
-		fmt.Printf("DRY RUN: Would execute: %s\n", strings.Join(args, " "))
-	} else {
-		fmt.Printf("Deploying %s...\n", packageName)
+		fmt.Printf("DRY RUN: Would create symlink %s -> %s\n", symlinkPath, packageDir)
+		return nil
 	}
 
-	cmd := exec.Command("stow", args[1:]...)
+	fmt.Printf("Deploying %s...\n", packageName)
 
-	// Set working directory based on package type
-	if strings.HasPrefix(packageName, ".config/") {
-		cmd.Dir = filepath.Join(dm.DotfilesDir, ".config")
-	} else {
-		cmd.Dir = dm.DotfilesDir
+	// Check if symlink already exists
+	if _, err := os.Lstat(symlinkPath); err == nil {
+		// Remove existing symlink or file
+		if err := os.Remove(symlinkPath); err != nil {
+			return fmt.Errorf("failed to remove existing %s: %w", symlinkPath, err)
+		}
 	}
 
-	output, err := cmd.CombinedOutput()
-
+	// Create the symlink
+	relativePackageDir, err := filepath.Rel(targetDir, packageDir)
 	if err != nil {
-		return fmt.Errorf("error deploying %s: %w\nOutput: %s", packageName, err, string(output))
+		return fmt.Errorf("failed to calculate relative path: %w", err)
 	}
 
-	if !dryRun {
-		fmt.Printf("✓ Successfully deployed %s\n", packageName)
+	if err := os.Symlink(relativePackageDir, symlinkPath); err != nil {
+		return fmt.Errorf("failed to create symlink %s -> %s: %w", symlinkPath, relativePackageDir, err)
 	}
-	if len(output) > 0 {
-		fmt.Printf("%s\n", string(output))
-	}
+
+	fmt.Printf("✓ Successfully deployed %s\n", packageName)
+	fmt.Printf("LINK: %s -> %s\n", symlinkPath, relativePackageDir)
 
 	return nil
 }
 
 func (dm *DotfilesManager) undeployPackage(packageName string, dryRun bool) error {
-	if !dm.isStowAvailable() {
-		return fmt.Errorf("GNU stow is not available")
+	// Determine target directory and symlink path
+	usr, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("failed to get current user: %w", err)
 	}
 
-	var stowPackageName string
+	var symlinkPath string
 
-	// Handle .config packages specially
-	if strings.HasPrefix(packageName, ".config/") {
-		stowPackageName = strings.TrimPrefix(packageName, ".config/")
+	if isConfigPackage(packageName) {
+		// Config packages are at ~/.config/PACKAGE_NAME
+		symlinkPath = filepath.Join(usr.HomeDir, ".config", packageName)
 	} else {
-		stowPackageName = packageName
+		if packageName == "shell" {
+			// Shell package: remove individual files from home directory
+			return dm.undeployShellPackage(filepath.Join(dm.DotfilesDir, packageName), usr.HomeDir, dryRun)
+		} else {
+			// Other home packages are at ~/PACKAGE_NAME
+			symlinkPath = filepath.Join(usr.HomeDir, packageName)
+		}
 	}
-
-	args := []string{"--delete"}
-	args = append(args, dm.Config.StowOptions...)
-	args = append(args, stowPackageName)
 
 	if dryRun {
-		args = append(args, "--no")
-		fmt.Printf("DRY RUN: Would execute: stow %s\n", strings.Join(args, " "))
-	} else {
-		fmt.Printf("Undeploying %s...\n", packageName)
+		fmt.Printf("DRY RUN: Would remove symlink %s\n", symlinkPath)
+		return nil
 	}
 
-	cmd := exec.Command("stow", args...)
+	fmt.Printf("Undeploying %s...\n", packageName)
 
-	// Set working directory based on package type
-	if strings.HasPrefix(packageName, ".config/") {
-		cmd.Dir = filepath.Join(dm.DotfilesDir, ".config")
-	} else {
-		cmd.Dir = dm.DotfilesDir
+	// Check if symlink exists
+	if _, err := os.Lstat(symlinkPath); os.IsNotExist(err) {
+		fmt.Printf("✓ %s is not deployed\n", packageName)
+		return nil
 	}
 
-	output, err := cmd.CombinedOutput()
-
-	if err != nil {
-		return fmt.Errorf("error undeploying %s: %w\nOutput: %s", packageName, err, string(output))
+	// Remove the symlink
+	if err := os.Remove(symlinkPath); err != nil {
+		return fmt.Errorf("failed to remove symlink %s: %w", symlinkPath, err)
 	}
 
-	if !dryRun {
-		fmt.Printf("✓ Successfully undeployed %s\n", packageName)
-	}
-
+	fmt.Printf("✓ Successfully undeployed %s\n", packageName)
 	return nil
 }
-
 func (dm *DotfilesManager) deployAll(packages []string, dryRun bool) {
 	if len(packages) == 0 {
 		packages = dm.getPackagesForSystem("")
@@ -465,7 +451,7 @@ func (dm *DotfilesManager) undeployAll(packages []string, dryRun bool) {
 func (dm *DotfilesManager) status() error {
 	fmt.Printf("Dotfiles directory: %s\n", dm.DotfilesDir)
 	fmt.Printf("Current system: %s\n", dm.System)
-	fmt.Printf("GNU stow available: %s\n", boolToCheckmark(dm.isStowAvailable()))
+	// GNU stow no longer required - using native symlinks
 	fmt.Printf("GitHub CLI available: %s\n", boolToCheckmark(dm.isGitHubCLIAvailable()))
 	if dm.isGitHubCLIAvailable() {
 		fmt.Printf("GitHub authenticated: %s\n", boolToCheckmark(dm.isGitHubAuthenticated()))
@@ -567,6 +553,211 @@ func (dm *DotfilesManager) removePackage(packageName string) error {
 	return nil
 }
 
+func (dm *DotfilesManager) adoptConfigDirectories(dryRun bool, args []string) error {
+	usr, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("failed to get current user: %w", err)
+	}
+
+	configDir := filepath.Join(usr.HomeDir, ".config")
+	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		fmt.Println("No ~/.config directory found")
+		return nil
+	}
+
+	// Parse arguments: first arg might be package name, rest are systems
+	var targetPackages []string
+	var systems []string
+
+	if len(args) > 0 {
+		// Check if first argument looks like a package name (not a known system)
+		firstArg := args[0]
+		if !isKnownSystem(firstArg) {
+			// First argument is likely a package name
+			targetPackages = []string{firstArg}
+			systems = args[1:]
+		} else {
+			// All arguments are systems (adopt all packages)
+			systems = args
+		}
+	}
+
+	// Default systems if none provided
+	if len(systems) == 0 {
+		systems = []string{"all"}
+	}
+
+	// Get currently managed packages
+	managedPackages := make(map[string]bool)
+	for packageName := range dm.Config.Packages {
+		if isConfigPackage(packageName) {
+			managedPackages[packageName] = true
+		}
+	}
+
+	var newPackages []string
+
+	if len(targetPackages) > 0 {
+		// Adopt specific packages
+		for _, packageName := range targetPackages {
+			// Skip if already managed
+			if managedPackages[packageName] {
+				fmt.Printf("Package '%s' is already managed\n", packageName)
+				continue
+			}
+
+			// Check if it's already a symlink
+			configPath := filepath.Join(configDir, packageName)
+			if info, err := os.Lstat(configPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+				fmt.Printf("Package '%s' is already a symlink\n", packageName)
+				continue
+			}
+
+			// Check if directory exists
+			if _, err := os.Stat(configPath); os.IsNotExist(err) {
+				fmt.Printf("Package '%s' not found in ~/.config\n", packageName)
+				continue
+			}
+
+			newPackages = append(newPackages, packageName)
+		}
+	} else {
+		// Adopt all unmanaged packages
+		entries, err := os.ReadDir(configDir)
+		if err != nil {
+			return fmt.Errorf("failed to read ~/.config directory: %w", err)
+		}
+
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+
+			packageName := entry.Name()
+
+			// Skip if already managed
+			if managedPackages[packageName] {
+				continue
+			}
+
+			// Skip common non-package directories
+			if shouldSkipDirectory(packageName) {
+				continue
+			}
+
+			// Check if it's already a symlink (managed by something else)
+			configPath := filepath.Join(configDir, packageName)
+			if info, err := os.Lstat(configPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+
+			newPackages = append(newPackages, packageName)
+		}
+	}
+
+	if len(newPackages) == 0 {
+		if len(targetPackages) > 0 {
+			fmt.Println("No specified packages available to adopt")
+		} else {
+			fmt.Println("No new config directories found to adopt")
+		}
+		return nil
+	}
+
+	if len(targetPackages) > 0 {
+		fmt.Printf("Adopting specific package(s): %s\n", strings.Join(newPackages, ", "))
+	} else {
+		fmt.Printf("Found %d new config directories to adopt:\n", len(newPackages))
+		for _, pkg := range newPackages {
+			fmt.Printf("  - %s\n", pkg)
+		}
+	}
+
+	if dryRun {
+		fmt.Printf("\nDRY RUN: Would adopt these packages for systems: %s\n", strings.Join(systems, ", "))
+		return nil
+	}
+
+	fmt.Printf("\nAdopting packages for systems: %s\n", strings.Join(systems, ", "))
+
+	// Adopt each package
+	adoptedCount := 0
+	for _, packageName := range newPackages {
+		if err := dm.adoptSinglePackage(packageName, systems, configDir); err != nil {
+			fmt.Printf("✗ Failed to adopt %s: %v\n", packageName, err)
+		} else {
+			adoptedCount++
+			fmt.Printf("✓ Adopted %s\n", packageName)
+		}
+	}
+
+	// Save updated configuration
+	if err := dm.saveConfig(nil); err != nil {
+		return fmt.Errorf("failed to save configuration: %w", err)
+	}
+
+	fmt.Printf("\nSuccessfully adopted %d/%d packages\n", adoptedCount, len(newPackages))
+	return nil
+}
+func (dm *DotfilesManager) adoptSinglePackage(packageName string, systems []string, configDir string) error {
+	sourcePath := filepath.Join(configDir, packageName)
+	targetPath := filepath.Join(dm.DotfilesDir, packageName)
+
+	// Move the directory from ~/.config to ~/.dotfiles
+	if err := os.Rename(sourcePath, targetPath); err != nil {
+		return fmt.Errorf("failed to move %s to dotfiles: %w", packageName, err)
+	}
+
+	// Create symlink back to ~/.config
+	relativeTargetPath, err := filepath.Rel(configDir, targetPath)
+	if err != nil {
+		return fmt.Errorf("failed to calculate relative path: %w", err)
+	}
+
+	if err := os.Symlink(relativeTargetPath, sourcePath); err != nil {
+		// Try to move back if symlink fails
+		os.Rename(targetPath, sourcePath)
+		return fmt.Errorf("failed to create symlink: %w", err)
+	}
+
+	// Add to configuration
+	if len(systems) == 1 && isSimpleSystem(systems[0]) {
+		dm.Config.Packages[packageName] = systems[0]
+	} else {
+		dm.Config.Packages[packageName] = map[string]interface{}{
+			"systems": systems,
+		}
+	}
+
+	return nil
+}
+
+func shouldSkipDirectory(name string) bool {
+	// Skip common directories that shouldn't be managed
+	skipDirs := []string{
+		"pulse", "systemd", "dconf", "gconf", "ibus", "fontconfig",
+		"gtk-2.0", "gtk-3.0", "gtk-4.0", "qt5ct", "qt6ct", "Trolltech.conf",
+		"mimeapps.list", "user-dirs.dirs", "user-dirs.locale",
+	}
+
+	for _, skip := range skipDirs {
+		if name == skip {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isKnownSystem(name string) bool {
+	knownSystems := []string{"all", "linux", "macos", "arch", "ubuntu", "debian", "fedora", "windows"}
+	for _, system := range knownSystems {
+		if name == system {
+			return true
+		}
+	}
+	return false
+}
 func (dm *DotfilesManager) initializeConfig(dryRun bool) error {
 	// Check if config already exists
 	if _, err := os.Stat(dm.ConfigFile); err == nil {
@@ -809,6 +1000,90 @@ func isSimpleSystem(system string) bool {
 	return false
 }
 
+func isConfigPackage(packageName string) bool {
+	// Packages that go to home directory (~/)
+	// - Packages starting with "." (like .oh-my-zsh, .zshrc)
+	// - shell package (contains shell configs like .zshrc, .bashrc)
+	if strings.HasPrefix(packageName, ".") || packageName == "shell" {
+		return false // Goes to ~/
+	}
+
+	// Everything else goes to ~/.config/
+	return true
+}
+
+func (dm *DotfilesManager) deployShellPackage(packageDir, homeDir string, dryRun bool) error {
+	// For shell package, symlink each file directly to home directory
+	entries, err := os.ReadDir(packageDir)
+	if err != nil {
+		return fmt.Errorf("failed to read shell package directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		sourcePath := filepath.Join(packageDir, entry.Name())
+		targetPath := filepath.Join(homeDir, entry.Name())
+
+		if dryRun {
+			fmt.Printf("DRY RUN: Would create symlink %s -> %s\n", targetPath, sourcePath)
+			continue
+		}
+
+		// Check if target already exists
+		if _, err := os.Lstat(targetPath); err == nil {
+			// Remove existing symlink or file
+			if err := os.Remove(targetPath); err != nil {
+				return fmt.Errorf("failed to remove existing %s: %w", targetPath, err)
+			}
+		}
+
+		// Create relative path for symlink
+		relativeSourcePath, err := filepath.Rel(homeDir, sourcePath)
+		if err != nil {
+			return fmt.Errorf("failed to calculate relative path: %w", err)
+		}
+
+		// Create the symlink
+		if err := os.Symlink(relativeSourcePath, targetPath); err != nil {
+			return fmt.Errorf("failed to create symlink %s -> %s: %w", targetPath, relativeSourcePath, err)
+		}
+
+		fmt.Printf("LINK: %s -> %s\n", targetPath, relativeSourcePath)
+	}
+
+	return nil
+}
+
+func (dm *DotfilesManager) undeployShellPackage(packageDir, homeDir string, dryRun bool) error {
+	// For shell package, remove each symlinked file from home directory
+	entries, err := os.ReadDir(packageDir)
+	if err != nil {
+		return fmt.Errorf("failed to read shell package directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		targetPath := filepath.Join(homeDir, entry.Name())
+
+		if dryRun {
+			fmt.Printf("DRY RUN: Would remove symlink %s\n", targetPath)
+			continue
+		}
+
+		// Check if symlink exists
+		if _, err := os.Lstat(targetPath); os.IsNotExist(err) {
+			continue // Skip if doesn't exist
+		}
+
+		// Remove the symlink
+		if err := os.Remove(targetPath); err != nil {
+			return fmt.Errorf("failed to remove symlink %s: %w", targetPath, err)
+		}
+
+		fmt.Printf("UNLINK: %s\n", targetPath)
+	}
+
+	return nil
+}
+
 func boolToCheckmark(b bool) string {
 	if b {
 		return "✓"
@@ -851,6 +1126,7 @@ Commands:
   status                  Show current status
   add <package> [systems...] Add package to configuration
   remove <package>        Remove package from configuration
+  adopt [package] [systems...]  Adopt config directories from ~/.config (default: all packages, all systems)
   github-repo <owner/repo> [branch] Set GitHub repository for sync
   sync                    Sync dotfiles to GitHub repository
   pull                    Pull dotfiles from GitHub repository
@@ -869,6 +1145,11 @@ Examples:
   dotctl add vim linux macos      # Add vim package for Linux and macOS
   dotctl add shell all             # Add shell package for all systems
   dotctl remove vim                # Remove vim from configuration
+  dotctl adopt                     # Adopt all new config directories for all systems
+  dotctl adopt arch linux          # Adopt all new config directories for specific systems
+  dotctl adopt new-app             # Adopt specific package for all systems
+  dotctl adopt new-app arch        # Adopt specific package for specific systems
+  dotctl --dry-run adopt           # Preview what would be adopted
   dotctl github-repo user/dotfiles # Set GitHub repository
   dotctl sync                      # Push dotfiles to GitHub
   dotctl pull                      # Pull dotfiles from GitHub
@@ -961,6 +1242,12 @@ func main() {
 		}
 		if err := manager.removePackage(commandArgs[0]); err != nil {
 			fmt.Printf("Error removing package: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "adopt":
+		if err := manager.adoptConfigDirectories(dryRun, commandArgs); err != nil {
+			fmt.Printf("Error adopting config directories: %v\n", err)
 			os.Exit(1)
 		}
 
