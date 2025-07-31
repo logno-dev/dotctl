@@ -467,6 +467,65 @@ func (dm *DotfilesManager) removePackage(packageName string) error {
 	return nil
 }
 
+func (dm *DotfilesManager) initializeConfig(dryRun bool) error {
+	// Check if config already exists
+	if _, err := os.Stat(dm.ConfigFile); err == nil {
+		fmt.Printf("Configuration file already exists at %s\n", dm.ConfigFile)
+		fmt.Println("Use --force to overwrite existing configuration")
+		return nil
+	}
+
+	// Scan for packages
+	packages, err := dm.scanPackages()
+	if err != nil {
+		return fmt.Errorf("failed to scan packages: %w", err)
+	}
+
+	if len(packages) == 0 {
+		fmt.Printf("No package directories found in %s\n", dm.DotfilesDir)
+		fmt.Println("Create package directories first, then run 'dotctl init'")
+		return nil
+	}
+
+	if dryRun {
+		fmt.Printf("DRY RUN: Would create configuration with packages: %s\n", strings.Join(packages, ", "))
+		fmt.Printf("DRY RUN: All packages would be configured for current system: %s\n", dm.System)
+		return nil
+	}
+
+	// Create new config with detected packages
+	newConfig := &Config{
+		Packages:       make(map[string]interface{}),
+		GlobalExcludes: []string{".git", ".DS_Store", "*.pyc", "__pycache__"},
+		StowOptions:    []string{"--verbose"},
+	}
+
+	// Set target directory
+	usr, err := user.Current()
+	if err == nil {
+		newConfig.StowOptions = append(newConfig.StowOptions, "--target="+usr.HomeDir)
+	}
+
+	// Add all detected packages for current system
+	for _, pkg := range packages {
+		newConfig.Packages[pkg] = dm.System
+	}
+
+	// Save the configuration
+	dm.Config = newConfig
+	if err := dm.saveConfig(nil); err != nil {
+		return fmt.Errorf("failed to save configuration: %w", err)
+	}
+
+	fmt.Printf("✓ Initialized configuration with %d packages for system '%s'\n", len(packages), dm.System)
+	fmt.Printf("Packages configured: %s\n", strings.Join(packages, ", "))
+	fmt.Printf("Configuration saved to: %s\n", dm.ConfigFile)
+	fmt.Println("\nYou can now run 'dotctl deploy' to deploy your dotfiles")
+	fmt.Println("Use 'dotctl add <package> <systems...>' to configure packages for other systems")
+
+	return nil
+}
+
 func (dm *DotfilesManager) setGitHubRepo(repository, branch string) error {
 	if dm.Config.GitHub == nil {
 		dm.Config.GitHub = &GitHubConfig{}
@@ -660,6 +719,7 @@ Usage:
   dotctl <command> [options] [args]
 
 Commands:
+  init                    Initialize configuration by scanning package directories
   deploy [packages...]    Deploy packages (default: all for current system)
   undeploy [packages...]  Undeploy packages (default: all for current system)
   status                  Show current status
@@ -675,6 +735,7 @@ Options:
   --help                 Show this help message
 
 Examples:
+  dotctl init                      # Initialize config from existing packages
   dotctl deploy                    # Deploy all packages for current system
   dotctl deploy vim tmux           # Deploy specific packages
   dotctl undeploy shell            # Undeploy specific package
@@ -737,6 +798,12 @@ func main() {
 	}
 
 	switch command {
+	case "init":
+		if err := manager.initializeConfig(dryRun); err != nil {
+			fmt.Printf("Error initializing configuration: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "deploy":
 		manager.deployAll(commandArgs, dryRun)
 

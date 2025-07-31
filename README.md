@@ -88,7 +88,12 @@ Make sure `~/bin` is in your PATH.
    mv ~/.bashrc ~/.dotfiles/shell/
    ```
 
-4. **Add packages to configuration**:
+4. **Initialize configuration** (automatically detects packages):
+   ```bash
+   dotctl init
+   ```
+
+   Or manually add packages to configuration:
    ```bash
    dotctl add vim all
    dotctl add tmux linux macos
@@ -104,6 +109,7 @@ Make sure `~/bin` is in your PATH.
 
 ### Commands
 
+- `dotctl init` - Initialize configuration by scanning package directories
 - `dotctl deploy [packages...]` - Deploy packages (default: all for current system)
 - `dotctl undeploy [packages...]` - Undeploy packages
 - `dotctl status` - Show current status and package information
@@ -122,6 +128,9 @@ Make sure `~/bin` is in your PATH.
 ### Examples
 
 ```bash
+# Initialize configuration from existing packages
+dotctl init
+
 # Deploy all packages for current system
 dotctl deploy
 
