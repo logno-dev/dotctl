@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	// "io/fs"
 	"os"
 	"os/exec"
 	"os/user"
@@ -11,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
 type PackageConfig struct {
@@ -18,10 +18,16 @@ type PackageConfig struct {
 	Description string   `json:"description,omitempty"`
 }
 
+type GitHubConfig struct {
+	Repository string `json:"repository,omitempty"`
+	Branch     string `json:"branch,omitempty"`
+}
+
 type Config struct {
 	Packages       map[string]interface{} `json:"packages"`
 	GlobalExcludes []string               `json:"global_excludes"`
 	StowOptions    []string               `json:"stow_options"`
+	GitHub         *GitHubConfig          `json:"github,omitempty"`
 }
 
 type DotfilesManager struct {
@@ -150,6 +156,21 @@ func (dm *DotfilesManager) saveConfig(config *Config) error {
 
 func (dm *DotfilesManager) isStowAvailable() bool {
 	_, err := exec.LookPath("stow")
+	return err == nil
+}
+
+func (dm *DotfilesManager) isGitHubCLIAvailable() bool {
+	_, err := exec.LookPath("gh")
+	return err == nil
+}
+
+func (dm *DotfilesManager) isGitHubAuthenticated() bool {
+	if !dm.isGitHubCLIAvailable() {
+		return false
+	}
+
+	cmd := exec.Command("gh", "auth", "status")
+	err := cmd.Run()
 	return err == nil
 }
 
@@ -345,6 +366,16 @@ func (dm *DotfilesManager) status() error {
 	fmt.Printf("Dotfiles directory: %s\n", dm.DotfilesDir)
 	fmt.Printf("Current system: %s\n", dm.System)
 	fmt.Printf("GNU stow available: %s\n", boolToCheckmark(dm.isStowAvailable()))
+	fmt.Printf("GitHub CLI available: %s\n", boolToCheckmark(dm.isGitHubCLIAvailable()))
+	if dm.isGitHubCLIAvailable() {
+		fmt.Printf("GitHub authenticated: %s\n", boolToCheckmark(dm.isGitHubAuthenticated()))
+	}
+	if dm.Config.GitHub != nil && dm.Config.GitHub.Repository != "" {
+		fmt.Printf("GitHub repository: %s\n", dm.Config.GitHub.Repository)
+		if dm.Config.GitHub.Branch != "" {
+			fmt.Printf("GitHub branch: %s\n", dm.Config.GitHub.Branch)
+		}
+	}
 	fmt.Println()
 
 	allPackages, err := dm.scanPackages()
@@ -436,6 +467,175 @@ func (dm *DotfilesManager) removePackage(packageName string) error {
 	return nil
 }
 
+func (dm *DotfilesManager) setGitHubRepo(repository, branch string) error {
+	if dm.Config.GitHub == nil {
+		dm.Config.GitHub = &GitHubConfig{}
+	}
+
+	dm.Config.GitHub.Repository = repository
+	if branch != "" {
+		dm.Config.GitHub.Branch = branch
+	} else {
+		dm.Config.GitHub.Branch = "main"
+	}
+
+	if err := dm.saveConfig(nil); err != nil {
+		return err
+	}
+
+	fmt.Printf("Set GitHub repository to '%s' (branch: %s)\n", repository, dm.Config.GitHub.Branch)
+	return nil
+}
+
+func (dm *DotfilesManager) syncToGitHub(dryRun bool) error {
+	if dm.Config.GitHub == nil || dm.Config.GitHub.Repository == "" {
+		return fmt.Errorf("no GitHub repository configured. Use 'dotctl github-repo <owner/repo>' first")
+	}
+
+	if !dm.isGitHubCLIAvailable() {
+		return fmt.Errorf("GitHub CLI (gh) is not available. Please install it:\n" +
+			"  - Visit: https://cli.github.com/\n" +
+			"  - Or use: brew install gh")
+	}
+
+	if !dm.isGitHubAuthenticated() {
+		return fmt.Errorf("GitHub CLI is not authenticated. Run 'gh auth login' first")
+	}
+
+	// Check if dotfiles directory is a git repository
+	gitDir := filepath.Join(dm.DotfilesDir, ".git")
+	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		if dryRun {
+			fmt.Printf("DRY RUN: Would initialize git repository in %s\n", dm.DotfilesDir)
+			fmt.Printf("DRY RUN: Would add remote origin %s\n", dm.Config.GitHub.Repository)
+		} else {
+			fmt.Printf("Initializing git repository in %s...\n", dm.DotfilesDir)
+			if err := dm.runGitCommand("init"); err != nil {
+				return fmt.Errorf("failed to initialize git repository: %w", err)
+			}
+
+			// Add remote origin
+			repoURL := fmt.Sprintf("https://github.com/%s.git", dm.Config.GitHub.Repository)
+			if err := dm.runGitCommand("remote", "add", "origin", repoURL); err != nil {
+				return fmt.Errorf("failed to add remote origin: %w", err)
+			}
+		}
+	}
+
+	branch := dm.Config.GitHub.Branch
+	if branch == "" {
+		branch = "main"
+	}
+
+	if dryRun {
+		fmt.Printf("DRY RUN: Would add all files to git\n")
+		fmt.Printf("DRY RUN: Would commit changes\n")
+		fmt.Printf("DRY RUN: Would push to %s:%s\n", dm.Config.GitHub.Repository, branch)
+		return nil
+	}
+
+	fmt.Printf("Syncing to GitHub repository %s...\n", dm.Config.GitHub.Repository)
+
+	// Add all files
+	if err := dm.runGitCommand("add", "."); err != nil {
+		return fmt.Errorf("failed to add files: %w", err)
+	}
+
+	// Check if there are changes to commit
+	cmd := exec.Command("git", "diff", "--cached", "--quiet")
+	cmd.Dir = dm.DotfilesDir
+	if err := cmd.Run(); err == nil {
+		fmt.Println("No changes to commit")
+		return nil
+	}
+
+	// Commit changes
+	commitMsg := fmt.Sprintf("Update dotfiles - %s", getCurrentTimestamp())
+	if err := dm.runGitCommand("commit", "-m", commitMsg); err != nil {
+		return fmt.Errorf("failed to commit changes: %w", err)
+	}
+
+	// Push to GitHub
+	if err := dm.runGitCommand("push", "-u", "origin", branch); err != nil {
+		return fmt.Errorf("failed to push to GitHub: %w", err)
+	}
+
+	fmt.Printf("✓ Successfully synced to GitHub repository %s\n", dm.Config.GitHub.Repository)
+	return nil
+}
+
+func (dm *DotfilesManager) pullFromGitHub(dryRun bool) error {
+	if dm.Config.GitHub == nil || dm.Config.GitHub.Repository == "" {
+		return fmt.Errorf("no GitHub repository configured")
+	}
+
+	if !dm.isGitHubCLIAvailable() {
+		return fmt.Errorf("GitHub CLI (gh) is not available")
+	}
+
+	if !dm.isGitHubAuthenticated() {
+		return fmt.Errorf("GitHub CLI is not authenticated. Run 'gh auth login' first")
+	}
+
+	// Check if dotfiles directory is a git repository
+	gitDir := filepath.Join(dm.DotfilesDir, ".git")
+	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		if dryRun {
+			fmt.Printf("DRY RUN: Would clone repository %s to %s\n", dm.Config.GitHub.Repository, dm.DotfilesDir)
+		} else {
+			fmt.Printf("Cloning repository %s...\n", dm.Config.GitHub.Repository)
+			repoURL := fmt.Sprintf("https://github.com/%s.git", dm.Config.GitHub.Repository)
+
+			// Clone to a temporary directory first, then move contents
+			tempDir := dm.DotfilesDir + ".tmp"
+			cmd := exec.Command("git", "clone", repoURL, tempDir)
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("failed to clone repository: %w", err)
+			}
+
+			// Move contents from temp directory to dotfiles directory
+			if err := os.Rename(tempDir, dm.DotfilesDir); err != nil {
+				return fmt.Errorf("failed to move cloned repository: %w", err)
+			}
+		}
+		return nil
+	}
+
+	branch := dm.Config.GitHub.Branch
+	if branch == "" {
+		branch = "main"
+	}
+
+	if dryRun {
+		fmt.Printf("DRY RUN: Would pull from %s:%s\n", dm.Config.GitHub.Repository, branch)
+		return nil
+	}
+
+	fmt.Printf("Pulling from GitHub repository %s...\n", dm.Config.GitHub.Repository)
+
+	// Pull changes
+	if err := dm.runGitCommand("pull", "origin", branch); err != nil {
+		return fmt.Errorf("failed to pull from GitHub: %w", err)
+	}
+
+	fmt.Printf("✓ Successfully pulled from GitHub repository %s\n", dm.Config.GitHub.Repository)
+	return nil
+}
+
+func (dm *DotfilesManager) runGitCommand(args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dm.DotfilesDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git command failed: %w\nOutput: %s", err, string(output))
+	}
+	return nil
+}
+
+func getCurrentTimestamp() string {
+	return time.Now().Format("2006-01-02 15:04:05")
+}
+
 func isSimpleSystem(system string) bool {
 	simple := []string{"all", "linux", "macos", "arch", "ubuntu", "debian", "fedora"}
 	for _, s := range simple {
@@ -465,6 +665,9 @@ Commands:
   status                  Show current status
   add <package> [systems...] Add package to configuration
   remove <package>        Remove package from configuration
+  github-repo <owner/repo> [branch] Set GitHub repository for sync
+  sync                    Sync dotfiles to GitHub repository
+  pull                    Pull dotfiles from GitHub repository
 
 Options:
   --dotfiles-dir <path>   Path to dotfiles directory (default: ~/.dotfiles)
@@ -479,6 +682,9 @@ Examples:
   dotctl add vim linux macos      # Add vim package for Linux and macOS
   dotctl add shell all             # Add shell package for all systems
   dotctl remove vim                # Remove vim from configuration
+  dotctl github-repo user/dotfiles # Set GitHub repository
+  dotctl sync                      # Push dotfiles to GitHub
+  dotctl pull                      # Pull dotfiles from GitHub
   dotctl --dry-run deploy          # Show what would be deployed`)
 }
 
@@ -562,6 +768,33 @@ func main() {
 		}
 		if err := manager.removePackage(commandArgs[0]); err != nil {
 			fmt.Printf("Error removing package: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "github-repo":
+		if len(commandArgs) == 0 {
+			fmt.Println("Error: github-repo command requires a repository (owner/repo)")
+			os.Exit(1)
+		}
+		repository := commandArgs[0]
+		branch := ""
+		if len(commandArgs) > 1 {
+			branch = commandArgs[1]
+		}
+		if err := manager.setGitHubRepo(repository, branch); err != nil {
+			fmt.Printf("Error setting GitHub repository: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "sync":
+		if err := manager.syncToGitHub(dryRun); err != nil {
+			fmt.Printf("Error syncing to GitHub: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "pull":
+		if err := manager.pullFromGitHub(dryRun); err != nil {
+			fmt.Printf("Error pulling from GitHub: %v\n", err)
 			os.Exit(1)
 		}
 

@@ -6,6 +6,7 @@ A system-aware dotfiles manager built in Go that uses GNU Stow for symlink manag
 
 - **System-aware deployment**: Configure packages for specific operating systems (Linux, macOS, Arch, Ubuntu, etc.)
 - **GNU Stow integration**: Leverages the proven GNU Stow tool for reliable symlink management
+- **GitHub integration**: Sync your dotfiles to/from GitHub repositories using GitHub CLI
 - **Zero dependencies**: Built with Go standard library only
 - **Dry-run support**: Preview changes before applying them
 - **Automatic system detection**: Detects your OS and Linux distribution automatically
@@ -29,6 +30,22 @@ sudo apt install stow
 
 # Fedora
 sudo dnf install stow
+```
+
+For GitHub integration, you also need GitHub CLI:
+
+```bash
+# macOS
+brew install gh
+
+# Arch Linux
+sudo pacman -S github-cli
+
+# Ubuntu/Debian
+sudo apt install gh
+
+# Fedora
+sudo dnf install gh
 ```
 
 ### Install dotctl
@@ -92,6 +109,9 @@ Make sure `~/bin` is in your PATH.
 - `dotctl status` - Show current status and package information
 - `dotctl add <package> [systems...]` - Add package to configuration
 - `dotctl remove <package>` - Remove package from configuration
+- `dotctl github-repo <owner/repo> [branch]` - Set GitHub repository for sync
+- `dotctl sync` - Sync dotfiles to GitHub repository
+- `dotctl pull` - Pull dotfiles from GitHub repository
 
 ### Options
 
@@ -125,6 +145,11 @@ dotctl remove old-package
 
 # Use custom dotfiles directory
 dotctl --dotfiles-dir ~/my-dotfiles deploy
+
+# GitHub integration
+dotctl github-repo username/my-dotfiles
+dotctl sync                          # Push to GitHub
+dotctl pull                          # Pull from GitHub
 ```
 
 ## Configuration
@@ -152,7 +177,11 @@ dotctl uses a `dotctl.json` file in your dotfiles directory. This file is automa
   "stow_options": [
     "--verbose",
     "--target=/home/username"
-  ]
+  ],
+  "github": {
+    "repository": "username/my-dotfiles",
+    "branch": "main"
+  }
 }
 ```
 
@@ -165,6 +194,51 @@ dotctl uses a `dotctl.json` file in your dotfiles directory. This file is automa
 - `ubuntu` - Ubuntu
 - `debian` - Debian
 - `fedora` - Fedora
+
+## GitHub Integration
+
+dotctl can sync your dotfiles to and from GitHub repositories using the GitHub CLI.
+
+### Setup
+
+1. **Install GitHub CLI** (see Prerequisites above)
+
+2. **Authenticate with GitHub**:
+   ```bash
+   gh auth login
+   ```
+
+3. **Configure your repository**:
+   ```bash
+   dotctl github-repo username/my-dotfiles
+   # Or specify a branch
+   dotctl github-repo username/my-dotfiles develop
+   ```
+
+### Usage
+
+- **Sync to GitHub** (commit and push changes):
+  ```bash
+  dotctl sync
+  ```
+
+- **Pull from GitHub** (pull latest changes):
+  ```bash
+  dotctl pull
+  ```
+
+- **Preview sync operations**:
+  ```bash
+  dotctl --dry-run sync
+  dotctl --dry-run pull
+  ```
+
+### How it Works
+
+- If your dotfiles directory isn't a git repository, `dotctl sync` will initialize it and add the GitHub remote
+- `dotctl sync` adds all files, commits with a timestamp, and pushes to the configured repository
+- `dotctl pull` pulls the latest changes from the configured branch
+- If the dotfiles directory doesn't exist when pulling, it will clone the repository
 
 ## Directory Structure
 
