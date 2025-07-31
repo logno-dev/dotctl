@@ -11,23 +11,25 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type PackageConfig struct {
-	Systems     []string `json:"systems,omitempty"`
-	Description string   `json:"description,omitempty"`
+	Systems     []string `yaml:"systems,omitempty" json:"systems,omitempty"`
+	Description string   `yaml:"description,omitempty" json:"description,omitempty"`
 }
 
 type GitHubConfig struct {
-	Repository string `json:"repository,omitempty"`
-	Branch     string `json:"branch,omitempty"`
+	Repository string `yaml:"repository,omitempty" json:"repository,omitempty"`
+	Branch     string `yaml:"branch,omitempty" json:"branch,omitempty"`
 }
 
 type Config struct {
-	Packages       map[string]interface{} `json:"packages"`
-	GlobalExcludes []string               `json:"global_excludes"`
-	StowOptions    []string               `json:"stow_options"`
-	GitHub         *GitHubConfig          `json:"github,omitempty"`
+	Packages       map[string]interface{} `yaml:"packages" json:"packages"`
+	GlobalExcludes []string               `yaml:"global_excludes" json:"global_excludes"`
+	StowOptions    []string               `yaml:"stow_options" json:"stow_options"`
+	GitHub         *GitHubConfig          `yaml:"github,omitempty" json:"github,omitempty"`
 }
 
 type DotfilesManager struct {
@@ -39,12 +41,18 @@ type DotfilesManager struct {
 
 func NewDotfilesManager(dotfilesDir string) (*DotfilesManager, error) {
 	if dotfilesDir == "" {
-		// First, check if we're already in a dotfiles directory (contains dotctl.json)
+		// First, check if we're already in a dotfiles directory (contains config file)
 		if cwd, err := os.Getwd(); err == nil {
-			configPath := filepath.Join(cwd, "dotctl.json")
-			if _, err := os.Stat(configPath); err == nil {
+			// Check for YAML config first, then JSON for backwards compatibility
+			yamlConfigPath := filepath.Join(cwd, "dotctl.yaml")
+			jsonConfigPath := filepath.Join(cwd, "dotctl.json")
+
+			if _, err := os.Stat(yamlConfigPath); err == nil {
 				dotfilesDir = cwd
-				fmt.Printf("Debug: Found dotctl.json in current directory: %s\n", configPath)
+				fmt.Printf("Debug: Found dotctl.yaml in current directory: %s\n", yamlConfigPath)
+			} else if _, err := os.Stat(jsonConfigPath); err == nil {
+				dotfilesDir = cwd
+				fmt.Printf("Debug: Found dotctl.json in current directory: %s\n", jsonConfigPath)
 			}
 		}
 
@@ -60,9 +68,19 @@ func NewDotfilesManager(dotfilesDir string) (*DotfilesManager, error) {
 	} else {
 		fmt.Printf("Debug: Using specified dotfiles directory: %s\n", dotfilesDir)
 	}
+
+	// Determine config file path (prefer YAML, fallback to JSON)
+	configFile := filepath.Join(dotfilesDir, "dotctl.yaml")
+	if _, err := os.Stat(configFile); os.IsNotExist(err) {
+		jsonConfigFile := filepath.Join(dotfilesDir, "dotctl.json")
+		if _, err := os.Stat(jsonConfigFile); err == nil {
+			configFile = jsonConfigFile
+		}
+	}
+
 	manager := &DotfilesManager{
 		DotfilesDir: dotfilesDir,
-		ConfigFile:  filepath.Join(dotfilesDir, "dotctl.json"),
+		ConfigFile:  configFile,
 		System:      detectSystem(),
 	}
 
@@ -132,10 +150,31 @@ func (dm *DotfilesManager) loadConfig() (*Config, error) {
 	}
 
 	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		fmt.Printf("Error parsing config: %v\n", err)
-		fmt.Printf("Config file content: %s\n", string(data))
-		return defaultConfig, nil
+
+	// Determine if this is a YAML or JSON file based on extension
+	isYAML := strings.HasSuffix(dm.ConfigFile, ".yaml") || strings.HasSuffix(dm.ConfigFile, ".yml")
+
+	if isYAML {
+		if err := yaml.Unmarshal(data, &config); err != nil {
+			fmt.Printf("Error parsing YAML config: %v\n", err)
+			fmt.Printf("Config file content: %s\n", string(data))
+			return defaultConfig, nil
+		}
+	} else {
+		// JSON parsing
+		if err := json.Unmarshal(data, &config); err != nil {
+			fmt.Printf("Error parsing JSON config: %v\n", err)
+			fmt.Printf("Config file content: %s\n", string(data))
+			return defaultConfig, nil
+		}
+
+		// If we successfully loaded a JSON config, migrate it to YAML
+		if err := dm.migrateJSONToYAML(&config); err != nil {
+			fmt.Printf("Warning: Failed to migrate JSON config to YAML: %v\n", err)
+		} else {
+			// Migration successful, reload the config from the new YAML file
+			return dm.loadConfig()
+		}
 	}
 
 	// Merge with defaults
@@ -166,12 +205,52 @@ func (dm *DotfilesManager) saveConfig(config *Config) error {
 		return fmt.Errorf("failed to create dotfiles directory: %w", err)
 	}
 
-	data, err := json.MarshalIndent(dm.Config, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+	// Always save as YAML (prefer .yaml extension)
+	if strings.HasSuffix(dm.ConfigFile, ".json") {
+		// Update config file path to use YAML extension
+		dm.ConfigFile = strings.TrimSuffix(dm.ConfigFile, ".json") + ".yaml"
 	}
 
-	return os.WriteFile(dm.ConfigFile, data, 0644)
+	data, err := yaml.Marshal(dm.Config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config to YAML: %w", err)
+	}
+
+	// Add a header comment to the YAML file
+	header := `# dotctl configuration file
+# This file defines your dotfiles packages and their target systems
+# For more information, visit: https://github.com/your-repo/dotctl
+
+`
+	finalData := append([]byte(header), data...)
+
+	return os.WriteFile(dm.ConfigFile, finalData, 0644)
+}
+
+// migrateJSONToYAML migrates an existing JSON config to YAML format
+func (dm *DotfilesManager) migrateJSONToYAML(config *Config) error {
+	jsonPath := dm.ConfigFile
+	yamlPath := strings.TrimSuffix(jsonPath, ".json") + ".yaml"
+
+	fmt.Printf("Migrating configuration from JSON to YAML...\n")
+
+	// Update the config file path to YAML
+	dm.ConfigFile = yamlPath
+
+	// Save the config as YAML
+	if err := dm.saveConfig(config); err != nil {
+		return fmt.Errorf("failed to save YAML config: %w", err)
+	}
+
+	// Remove the old JSON file
+	if err := os.Remove(jsonPath); err != nil {
+		fmt.Printf("Warning: Could not remove old JSON config file: %v\n", err)
+	} else {
+		fmt.Printf("✓ Successfully migrated config from %s to %s\n",
+			filepath.Base(jsonPath), filepath.Base(yamlPath))
+	}
+
+	return nil
 }
 
 func (dm *DotfilesManager) isGitHubCLIAvailable() bool {

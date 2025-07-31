@@ -195,30 +195,32 @@ dotctl automatically determines where packages should be deployed based on their
 
 ## Configuration
 
-dotctl uses a `dotctl.json` file in your dotfiles directory. This file is automatically created with sensible defaults.
+dotctl uses a `dotctl.yaml` file in your dotfiles directory. This file is automatically created with sensible defaults and supports comments for better documentation.
 
 ### Example Configuration
 
-```json
-{
-  "packages": {
-    "nvim": "all",
-    "tmux": "macos",
-    "bat": "all",
-    "shell": "all",
-    ".oh-my-zsh": "all"
-  },
-  "global_excludes": [
-    ".git",
-    ".DS_Store",
-    "*.pyc",
-    "__pycache__"
-  ],
-  "github": {
-    "repository": "username/my-dotfiles",
-    "branch": "main"
-  }
-}
+```yaml
+# dotctl configuration file
+# This file defines your dotfiles packages and their target systems
+
+packages:
+  nvim: all           # Neovim config for all systems
+  tmux: macos         # tmux only on macOS
+  bat: all            # bat config for all systems  
+  shell: all          # Shell configs for all systems
+  .oh-my-zsh: all     # Oh My Zsh for all systems
+
+# Files and directories to exclude from all packages
+global_excludes:
+  - .git
+  - .DS_Store
+  - "*.pyc"
+  - __pycache__
+
+# GitHub integration settings
+github:
+  repository: username/my-dotfiles  # Your GitHub repository
+  branch: main                      # Target branch (optional, defaults to main)
 ```
 
 ### Supported Systems
@@ -428,7 +430,7 @@ Your dotfiles directory should be organized like this:
 
 ```
 ~/.dotfiles/
-├── dotctl.json          # Configuration file
+├── dotctl.yaml          # Configuration file
 ├── nvim/                # Config package → ~/.config/nvim/
 │   ├── init.lua
 │   └── lua/
