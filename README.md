@@ -181,7 +181,7 @@ dotctl pull                          # Pull from GitHub
 
 ## Package Types
 
-dotctl automatically determines where packages should be deployed based on their names:
+dotctl automatically determines where packages should be deployed based on their names and configuration:
 
 ### Config Packages (→ `~/.config/`)
 - **Any package name that doesn't start with `.` and isn't named `shell`**
@@ -191,7 +191,19 @@ dotctl automatically determines where packages should be deployed based on their
 ### Home Packages (→ `~/`)
 - **Packages starting with `.`**: `.oh-my-zsh`, `.vim`, etc.
 - **`shell` package**: Contains shell configs like `.zshrc`, `.bashrc`
+- **Packages with `home: true` setting**: Any package can be forced to deploy to `~/` instead of `~/.config/`
 - Creates: `~/PACKAGE_NAME/` or individual files in `~/`
+
+### Home Setting Override
+You can force any package to be symlinked to the `$HOME` directory instead of `~/.config/` by using the `home` setting:
+
+```yaml
+packages:
+  my-scripts:
+    systems: [all]
+    home: true        # Forces symlink to ~/my-scripts instead of ~/.config/my-scripts
+    description: "Custom scripts directory"
+```
 
 ## Configuration
 
@@ -223,6 +235,12 @@ packages:
       - arch
     description: "Hyprland window manager config"
 
+  # Advanced package configuration with home setting
+  my-scripts:
+    systems: [all]
+    home: true        # Symlink to $HOME instead of ~/.config
+    description: "Custom scripts directory"
+
 # Files and directories to exclude from all packages
 global_excludes:
   - .git
@@ -245,6 +263,26 @@ github:
 - `ubuntu` - Ubuntu
 - `debian` - Debian
 - `fedora` - Fedora
+
+### Package Configuration Options
+
+When using the extended package configuration format, you can specify:
+
+- **`systems`**: Array of systems where the package should be deployed
+- **`description`**: Optional description of the package
+- **`home`**: Boolean flag to force symlink to `$HOME` instead of `~/.config/`
+
+```yaml
+packages:
+  # Simple format (deploys to default location based on package name)
+  nvim: all
+  
+  # Extended format with home setting
+  my-dotfiles:
+    systems: [linux, macos]
+    home: true
+    description: "Personal configuration files"
+```
 
 ## Template System
 

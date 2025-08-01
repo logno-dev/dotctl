@@ -18,6 +18,7 @@ import (
 type PackageConfig struct {
 	Systems     []string `yaml:"systems,omitempty" json:"systems,omitempty"`
 	Description string   `yaml:"description,omitempty" json:"description,omitempty"`
+	Home        bool     `yaml:"home,omitempty" json:"home,omitempty"`
 }
 
 type GitHubConfig struct {
@@ -312,6 +313,50 @@ func shouldDeployPackage(packageConfig interface{}, system string) bool {
 	}
 }
 
+func (dm *DotfilesManager) getPackageConfig(packageName string) *PackageConfig {
+	packageConfigInterface, exists := dm.Config.Packages[packageName]
+	if !exists {
+		return nil
+	}
+
+	switch config := packageConfigInterface.(type) {
+	case string:
+		// Simple string configuration (e.g., "all", "linux")
+		return &PackageConfig{
+			Systems: []string{config},
+		}
+	case map[string]interface{}:
+		// Complex configuration object
+		packageConfig := &PackageConfig{}
+
+		if systemsInterface, exists := config["systems"]; exists {
+			if systemsSlice, ok := systemsInterface.([]interface{}); ok {
+				for _, sys := range systemsSlice {
+					if sysStr, ok := sys.(string); ok {
+						packageConfig.Systems = append(packageConfig.Systems, sysStr)
+					}
+				}
+			}
+		}
+
+		if descInterface, exists := config["description"]; exists {
+			if desc, ok := descInterface.(string); ok {
+				packageConfig.Description = desc
+			}
+		}
+
+		if homeInterface, exists := config["home"]; exists {
+			if home, ok := homeInterface.(bool); ok {
+				packageConfig.Home = home
+			}
+		}
+
+		return packageConfig
+	default:
+		return nil
+	}
+}
+
 func (dm *DotfilesManager) scanPackages() ([]string, error) {
 	var packages []string
 
@@ -382,7 +427,13 @@ func (dm *DotfilesManager) deployPackage(packageName string, dryRun bool) error 
 	var targetDir string
 	var symlinkPath string
 
-	if isConfigPackage(packageName) {
+	// Check if package has home setting enabled
+	packageConfig := dm.getPackageConfig(packageName)
+	if packageConfig != nil && packageConfig.Home {
+		// Home setting enabled - symlink to $HOME directory
+		targetDir = usr.HomeDir
+		symlinkPath = filepath.Join(targetDir, packageName)
+	} else if isConfigPackage(packageName) {
 		// Config packages go to ~/.config/PACKAGE_NAME
 		targetDir = filepath.Join(usr.HomeDir, ".config")
 		symlinkPath = filepath.Join(targetDir, packageName)
@@ -448,7 +499,12 @@ func (dm *DotfilesManager) undeployPackage(packageName string, dryRun bool) erro
 
 	var symlinkPath string
 
-	if isConfigPackage(packageName) {
+	// Check if package has home setting enabled
+	packageConfig := dm.getPackageConfig(packageName)
+	if packageConfig != nil && packageConfig.Home {
+		// Home setting enabled - symlink is in $HOME directory
+		symlinkPath = filepath.Join(usr.HomeDir, packageName)
+	} else if isConfigPackage(packageName) {
 		// Config packages are at ~/.config/PACKAGE_NAME
 		symlinkPath = filepath.Join(usr.HomeDir, ".config", packageName)
 	} else {
