@@ -544,8 +544,8 @@ dotctl uses native Go symlink functionality with system-awareness:
 
 ## License
 
-[Add your license here]
+Dotctl is released under the [MIT License](https://opensource.org/licenses/MIT).
 
 ## Contributing
 
-[Add contribution guidelines here]
+Contributions welcome.
