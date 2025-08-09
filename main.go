@@ -412,6 +412,10 @@ func (dm *DotfilesManager) scanConfigPackages() ([]string, error) {
 }
 
 func (dm *DotfilesManager) deployPackage(packageName string, dryRun bool) error {
+	return dm.deployPackageWithOptions(packageName, dryRun, false)
+}
+
+func (dm *DotfilesManager) deployPackageWithOptions(packageName string, dryRun bool, interactive bool) error {
 	packageDir := filepath.Join(dm.DotfilesDir, packageName)
 
 	if _, err := os.Stat(packageDir); os.IsNotExist(err) {
@@ -441,7 +445,7 @@ func (dm *DotfilesManager) deployPackage(packageName string, dryRun bool) error 
 		// Home packages: handle special cases
 		if packageName == "shell" {
 			// Shell package contents go directly to home directory
-			return dm.deployShellPackage(packageDir, usr.HomeDir, dryRun)
+			return dm.deployShellPackageWithOptions(packageDir, usr.HomeDir, dryRun, interactive)
 		} else {
 			// Other home packages (like .oh-my-zsh) go to ~/PACKAGE_NAME
 			targetDir = usr.HomeDir
@@ -470,7 +474,7 @@ func (dm *DotfilesManager) deployPackage(packageName string, dryRun bool) error 
 	}
 
 	// Check if package contains templates
-	if err := dm.processPackageTemplates(packageDir, dryRun); err != nil {
+	if err := dm.processPackageTemplatesWithOptions(packageDir, dryRun, interactive); err != nil {
 		return fmt.Errorf("failed to process templates in %s: %w", packageName, err)
 	}
 
@@ -539,6 +543,10 @@ func (dm *DotfilesManager) undeployPackage(packageName string, dryRun bool) erro
 	return nil
 }
 func (dm *DotfilesManager) deployAll(packages []string, dryRun bool) {
+	dm.deployAllWithOptions(packages, dryRun, false)
+}
+
+func (dm *DotfilesManager) deployAllWithOptions(packages []string, dryRun bool, interactive bool) {
 	if len(packages) == 0 {
 		packages = dm.getPackagesForSystem("")
 	}
@@ -554,7 +562,7 @@ func (dm *DotfilesManager) deployAll(packages []string, dryRun bool) {
 
 	successCount := 0
 	for _, pkg := range packages {
-		if err := dm.deployPackage(pkg, dryRun); err != nil {
+		if err := dm.deployPackageWithOptions(pkg, dryRun, interactive); err != nil {
 			fmt.Printf("✗ %v\n", err)
 		} else {
 			successCount++
@@ -900,6 +908,10 @@ func isKnownSystem(name string) bool {
 }
 
 func (dm *DotfilesManager) processTemplate(templatePath, outputPath string) error {
+	return dm.processTemplateWithOptions(templatePath, outputPath, false)
+}
+
+func (dm *DotfilesManager) processTemplateWithOptions(templatePath, outputPath string, interactive bool) error {
 	// Read template file
 	templateContent, err := os.ReadFile(templatePath)
 	if err != nil {
@@ -909,12 +921,193 @@ func (dm *DotfilesManager) processTemplate(templatePath, outputPath string) erro
 	// Process template with current system
 	processedContent := dm.processTemplateContent(string(templateContent))
 
+	// Check if output file already exists
+	if existingContent, err := os.ReadFile(outputPath); err == nil {
+		// File exists - check if content differs
+		if string(existingContent) == processedContent {
+			// Content is identical, no need to overwrite
+			return nil
+		}
+
+		// Content differs - handle based on mode
+		if interactive {
+			// Show diff and ask user
+			shouldOverwrite, err := dm.promptForTemplateOverwrite(templatePath, outputPath, string(existingContent), processedContent)
+			if err != nil {
+				return fmt.Errorf("failed to prompt for overwrite: %w", err)
+			}
+			if !shouldOverwrite {
+				fmt.Printf("TEMPLATE: Skipped %s (user declined overwrite)\n", outputPath)
+				return nil
+			}
+		} else {
+			// Non-interactive mode: always overwrite with warning
+			fmt.Printf("TEMPLATE: Overwriting existing file %s (template takes precedence)\n", outputPath)
+		}
+	}
+
+	// Track template overwrite for commit marking (before writing)
+	if existingContent, err := os.ReadFile(outputPath); err == nil {
+		if string(existingContent) != processedContent {
+			dm.trackTemplateOverwrite(outputPath)
+		}
+	}
+
 	// Write processed content to output file
 	if err := os.WriteFile(outputPath, []byte(processedContent), 0644); err != nil {
 		return fmt.Errorf("failed to write processed template: %w", err)
 	}
 
 	return nil
+}
+
+// Track template overwrites for commit marking
+var templateOverwrites []string
+
+func (dm *DotfilesManager) trackTemplateOverwrite(filePath string) {
+	// Convert to relative path from dotfiles directory
+	relPath, err := filepath.Rel(dm.DotfilesDir, filePath)
+	if err != nil {
+		relPath = filePath
+	}
+	templateOverwrites = append(templateOverwrites, relPath)
+}
+
+func (dm *DotfilesManager) getTemplateOverwriteMessage() string {
+	if len(templateOverwrites) == 0 {
+		return ""
+	}
+
+	message := fmt.Sprintf("\n\n[TEMPLATE-OVERWRITES] The following files were regenerated from templates:\n")
+	for _, file := range templateOverwrites {
+		message += fmt.Sprintf("  - %s\n", file)
+	}
+	message += "\nTo revert template changes, use: git log --grep=\"TEMPLATE-OVERWRITES\" --oneline"
+
+	// Clear the list after generating message
+	templateOverwrites = nil
+
+	return message
+}
+
+func (dm *DotfilesManager) showTemplateHistory() error {
+	// Check if we're in a git repository
+	gitDir := filepath.Join(dm.DotfilesDir, ".git")
+	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		fmt.Println("Not a git repository. Template history is only available for git-managed dotfiles.")
+		return nil
+	}
+
+	fmt.Println("Commits with template overwrites:")
+	fmt.Println("=================================")
+
+	// Search for commits with template overwrite markers
+	cmd := exec.Command("git", "log", "--grep=TEMPLATE-OVERWRITES", "--oneline", "--reverse")
+	cmd.Dir = dm.DotfilesDir
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to search git history: %w", err)
+	}
+
+	if len(output) == 0 {
+		fmt.Println("No template overwrites found in git history.")
+		fmt.Println("\nTemplate overwrites are marked in commit messages when templates")
+		fmt.Println("regenerate existing files during deployment.")
+		return nil
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for i, line := range lines {
+		fmt.Printf("%d. %s\n", i+1, line)
+	}
+
+	fmt.Printf("\nFound %d commits with template overwrites.\n", len(lines))
+	fmt.Println("\nTo see details of a specific commit:")
+	fmt.Println("  git show <commit-hash>")
+	fmt.Println("\nTo revert a specific commit:")
+	fmt.Println("  git revert <commit-hash>")
+	fmt.Println("\nTo see what files were overwritten in a commit:")
+	fmt.Println("  git show --name-only <commit-hash>")
+
+	return nil
+}
+
+func (dm *DotfilesManager) promptForTemplateOverwrite(templatePath, outputPath, existingContent, newContent string) (bool, error) {
+	fmt.Printf("\n⚠️  Template output file already exists: %s\n", outputPath)
+	fmt.Printf("Template: %s\n", templatePath)
+	fmt.Printf("System: %s\n\n", dm.System)
+
+	// Show diff using a simple line-by-line comparison
+	fmt.Println("Differences found:")
+	fmt.Println("--- Existing file")
+	fmt.Println("+++ Template output")
+
+	existingLines := strings.Split(existingContent, "\n")
+	newLines := strings.Split(newContent, "\n")
+
+	maxLines := len(existingLines)
+	if len(newLines) > maxLines {
+		maxLines = len(newLines)
+	}
+
+	diffCount := 0
+	for i := 0; i < maxLines && diffCount < 10; i++ {
+		var existingLine, newLine string
+		if i < len(existingLines) {
+			existingLine = existingLines[i]
+		}
+		if i < len(newLines) {
+			newLine = newLines[i]
+		}
+
+		if existingLine != newLine {
+			if existingLine != "" {
+				fmt.Printf("-%s\n", existingLine)
+			}
+			if newLine != "" {
+				fmt.Printf("+%s\n", newLine)
+			}
+			diffCount++
+		}
+	}
+
+	if diffCount >= 10 {
+		fmt.Println("... (showing first 10 differences)")
+	}
+
+	fmt.Printf("\nOptions:\n")
+	fmt.Printf("  y - Overwrite with template output (recommended)\n")
+	fmt.Printf("  n - Keep existing file\n")
+	fmt.Printf("  d - Show full diff\n")
+	fmt.Printf("Choice [y/n/d]: ")
+
+	var response string
+	fmt.Scanln(&response)
+	response = strings.ToLower(strings.TrimSpace(response))
+
+	switch response {
+	case "d":
+		// Show full diff and ask again
+		fmt.Println("\n=== FULL DIFF ===")
+		fmt.Println("--- Existing file")
+		for i, line := range existingLines {
+			fmt.Printf("%3d: %s\n", i+1, line)
+		}
+		fmt.Println("\n+++ Template output")
+		for i, line := range newLines {
+			fmt.Printf("%3d: %s\n", i+1, line)
+		}
+		fmt.Printf("\nOverwrite with template output? [y/n]: ")
+		fmt.Scanln(&response)
+		return strings.ToLower(strings.TrimSpace(response)) == "y", nil
+	case "n":
+		return false, nil
+	case "y", "":
+		return true, nil
+	default:
+		fmt.Printf("Invalid choice '%s', defaulting to 'y'\n", response)
+		return true, nil
+	}
 }
 
 func (dm *DotfilesManager) processTemplateContent(content string) string {
@@ -970,6 +1163,10 @@ func (dm *DotfilesManager) matchesCondition(condition string) bool {
 }
 
 func (dm *DotfilesManager) processPackageTemplates(packageDir string, dryRun bool) error {
+	return dm.processPackageTemplatesWithOptions(packageDir, dryRun, false)
+}
+
+func (dm *DotfilesManager) processPackageTemplatesWithOptions(packageDir string, dryRun bool, interactive bool) error {
 	// Walk through package directory and process any .template files
 	return filepath.Walk(packageDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -990,8 +1187,8 @@ func (dm *DotfilesManager) processPackageTemplates(packageDir string, dryRun boo
 				return nil
 			}
 
-			// Process the template
-			if err := dm.processTemplate(path, outputPath); err != nil {
+			// Process the template with interactive option
+			if err := dm.processTemplateWithOptions(path, outputPath, interactive); err != nil {
 				return fmt.Errorf("failed to process template %s: %w", path, err)
 			}
 
@@ -1212,6 +1409,13 @@ func (dm *DotfilesManager) syncToGitHub(dryRun bool) error {
 
 	// Step 9: Commit changes
 	commitMsg := fmt.Sprintf("Update dotfiles - %s", getCurrentTimestamp())
+
+	// Add template overwrite information if any templates were processed
+	templateMsg := dm.getTemplateOverwriteMessage()
+	if templateMsg != "" {
+		commitMsg += templateMsg
+	}
+
 	if err := dm.runGitCommand("commit", "-m", commitMsg); err != nil {
 		return fmt.Errorf("failed to commit changes: %w", err)
 	}
@@ -1389,6 +1593,10 @@ func isConfigPackage(packageName string) bool {
 }
 
 func (dm *DotfilesManager) deployShellPackage(packageDir, homeDir string, dryRun bool) error {
+	return dm.deployShellPackageWithOptions(packageDir, homeDir, dryRun, false)
+}
+
+func (dm *DotfilesManager) deployShellPackageWithOptions(packageDir, homeDir string, dryRun bool, interactive bool) error {
 	// For shell package, symlink each file directly to home directory
 	entries, err := os.ReadDir(packageDir)
 	if err != nil {
@@ -1421,8 +1629,8 @@ func (dm *DotfilesManager) deployShellPackage(packageDir, homeDir string, dryRun
 				}
 			}
 
-			// Process template
-			if err := dm.processTemplate(sourcePath, targetPath); err != nil {
+			// Process template with interactive option
+			if err := dm.processTemplateWithOptions(sourcePath, targetPath, interactive); err != nil {
 				return fmt.Errorf("failed to process template %s: %w", fileName, err)
 			}
 
@@ -1536,6 +1744,7 @@ Commands:
   add <package> [systems...] Add package to configuration
   remove <package>        Remove package from configuration
   adopt [package] [systems...]  Adopt config directories from ~/.config (default: all packages, all systems)
+  template-history        Show commits where template files were overwritten
   github-repo <owner/repo> [branch] Set GitHub repository for sync
   sync                    Sync dotfiles to GitHub repository
   pull                    Pull dotfiles from GitHub repository
@@ -1543,6 +1752,7 @@ Commands:
 Options:
   --dotfiles-dir <path>   Path to dotfiles directory (default: ~/.dotfiles)
   --dry-run              Show what would be done without executing
+  --interactive, -i      Prompt before overwriting template output files
   --help                 Show this help message
 
 Examples:
@@ -1559,10 +1769,12 @@ Examples:
   dotctl adopt new-app             # Adopt specific package for all systems
   dotctl adopt new-app arch        # Adopt specific package for specific systems
   dotctl --dry-run adopt           # Preview what would be adopted
+  dotctl template-history          # Show commits with template overwrites
   dotctl github-repo user/dotfiles # Set GitHub repository
   dotctl sync                      # Push dotfiles to GitHub
   dotctl pull                      # Pull dotfiles from GitHub
-  dotctl --dry-run deploy          # Show what would be deployed`)
+  dotctl --dry-run deploy          # Show what would be deployed
+  dotctl --interactive deploy      # Deploy with prompts for template conflicts`)
 }
 
 func main() {
@@ -1573,6 +1785,7 @@ func main() {
 
 	var dotfilesDir string
 	var dryRun bool
+	var interactive bool
 	var args []string
 
 	// Simple argument parsing
@@ -1584,6 +1797,8 @@ func main() {
 			return
 		case arg == "--dry-run":
 			dryRun = true
+		case arg == "--interactive" || arg == "-i":
+			interactive = true
 		case arg == "--dotfiles-dir":
 			if i+1 < len(os.Args) {
 				dotfilesDir = os.Args[i+1]
@@ -1621,7 +1836,7 @@ func main() {
 		}
 
 	case "deploy":
-		manager.deployAll(commandArgs, dryRun)
+		manager.deployAllWithOptions(commandArgs, dryRun, interactive)
 
 	case "undeploy":
 		manager.undeployAll(commandArgs, dryRun)
@@ -1657,6 +1872,12 @@ func main() {
 	case "adopt":
 		if err := manager.adoptConfigDirectories(dryRun, commandArgs); err != nil {
 			fmt.Printf("Error adopting config directories: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "template-history":
+		if err := manager.showTemplateHistory(); err != nil {
+			fmt.Printf("Error showing template history: %v\n", err)
 			os.Exit(1)
 		}
 
