@@ -973,6 +973,940 @@ func (dm *DotfilesManager) trackTemplateOverwrite(filePath string) {
 	templateOverwrites = append(templateOverwrites, relPath)
 }
 
+// TemplateMergeConflict represents a conflict between a template and its base config file
+type TemplateMergeConflict struct {
+	TemplatePath   string // Path to the .template file
+	BasePath       string // Path to the generated base file
+	LocalContent   string // Current local content of base file
+	RemoteBase     string // Remote version of base file (if exists)
+	RemoteTemplate string // Remote version of template file
+}
+
+// detectTemplateMergeConflicts scans for conflicts between templates and base files
+func (dm *DotfilesManager) detectTemplateMergeConflicts() ([]TemplateMergeConflict, error) {
+	var conflicts []TemplateMergeConflict
+
+	// Walk through dotfiles directory looking for .template files
+	err := filepath.Walk(dm.DotfilesDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip .git directory
+		if info.IsDir() && info.Name() == ".git" {
+			return filepath.SkipDir
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		// Check if this is a template file
+		if strings.HasSuffix(info.Name(), ".template") {
+			basePath := strings.TrimSuffix(path, ".template")
+
+			// Check if base file exists
+			if _, err := os.Stat(basePath); err == nil {
+				// Base file exists - check for conflicts
+				localContent, err := os.ReadFile(basePath)
+				if err != nil {
+					return fmt.Errorf("failed to read base file %s: %w", basePath, err)
+				}
+
+				// Process template to see what it would generate
+				templateContent, err := os.ReadFile(path)
+				if err != nil {
+					return fmt.Errorf("failed to read template %s: %w", path, err)
+				}
+				processedTemplate := dm.processTemplateContent(string(templateContent))
+
+				// If content differs, we have a potential merge conflict
+				if string(localContent) != processedTemplate {
+					conflict := TemplateMergeConflict{
+						TemplatePath: path,
+						BasePath:     basePath,
+						LocalContent: string(localContent),
+					}
+
+					// Try to get remote versions if in git repo
+					relBasePath, _ := filepath.Rel(dm.DotfilesDir, basePath)
+					relTemplatePath, _ := filepath.Rel(dm.DotfilesDir, path)
+
+					// Get remote base file content
+					cmd := exec.Command("git", "show", "origin/main:"+relBasePath)
+					cmd.Dir = dm.DotfilesDir
+					if output, err := cmd.Output(); err == nil {
+						conflict.RemoteBase = string(output)
+					}
+
+					// Get remote template content
+					cmd = exec.Command("git", "show", "origin/main:"+relTemplatePath)
+					cmd.Dir = dm.DotfilesDir
+					if output, err := cmd.Output(); err == nil {
+						conflict.RemoteTemplate = string(output)
+					}
+
+					conflicts = append(conflicts, conflict)
+				}
+			}
+		}
+
+		return nil
+	})
+
+	return conflicts, err
+}
+
+// promptForTemplateMerge prompts the user to resolve a template merge conflict
+func (dm *DotfilesManager) promptForTemplateMerge(conflict TemplateMergeConflict) (string, error) {
+	fmt.Printf("\n⚠️  Template merge conflict detected\n")
+	fmt.Printf("Template: %s\n", conflict.TemplatePath)
+	fmt.Printf("Base file: %s\n", conflict.BasePath)
+	fmt.Println()
+
+	// Process current template to show what it would generate
+	templateContent, _ := os.ReadFile(conflict.TemplatePath)
+	newTemplateOutput := dm.processTemplateContent(string(templateContent))
+
+	fmt.Println("Options:")
+	fmt.Println("  1. Keep local changes in base file (ignore template)")
+	fmt.Println("  2. Use template output (discard local changes)")
+	fmt.Println("  3. Update template with base file changes (propagate changes)")
+	fmt.Println("  4. Merge base changes into template interactively")
+	fmt.Println("  5. Show diff between local and template output")
+	fmt.Println("  6. Show three-way merge (local | remote base | template)")
+	fmt.Println("  7. Manual edit base file (opens editor)")
+	fmt.Println("  8. Skip this file")
+	fmt.Printf("\nChoice [1-8]: ")
+
+	var choice string
+	fmt.Scanln(&choice)
+	choice = strings.TrimSpace(choice)
+
+	switch choice {
+	case "1":
+		// Keep local changes in base file only
+		return conflict.LocalContent, nil
+
+	case "2":
+		// Use template output
+		return newTemplateOutput, nil
+
+	case "3":
+		// Update template with base file changes (smart merge)
+		if err := dm.smartMergeIntoTemplate(conflict); err != nil {
+			if err.Error() != "cancelled by user" {
+				fmt.Printf("Error updating template: %v\n", err)
+			}
+			return dm.promptForTemplateMerge(conflict)
+		}
+		// After updating template, regenerate base file
+		templateContent, _ := os.ReadFile(conflict.TemplatePath)
+		return dm.processTemplateContent(string(templateContent)), nil
+
+	case "4":
+		// Merge base changes into template interactively
+		if err := dm.mergeIntoTemplateInteractive(conflict); err != nil {
+			fmt.Printf("Error merging into template: %v\n", err)
+			return dm.promptForTemplateMerge(conflict)
+		}
+		// After updating template, regenerate base file
+		templateContent, _ := os.ReadFile(conflict.TemplatePath)
+		return dm.processTemplateContent(string(templateContent)), nil
+
+	case "5":
+		// Show diff
+		dm.showDiff(conflict.LocalContent, newTemplateOutput, "Local changes", "Template output")
+		return dm.promptForTemplateMerge(conflict) // Ask again
+
+	case "6":
+		// Show three-way merge
+		if conflict.RemoteBase != "" && conflict.RemoteTemplate != "" {
+			dm.showThreeWayDiff(conflict)
+			fmt.Println("\nAfter reviewing the differences, choose how to proceed:")
+			return dm.promptForTemplateMerge(conflict)
+		} else {
+			fmt.Println("Remote versions not available for three-way merge")
+			return dm.promptForTemplateMerge(conflict)
+		}
+
+	case "7":
+		// Manual edit base file
+		return dm.manualEditMerge(conflict)
+
+	case "8":
+		// Skip
+		return "", fmt.Errorf("skipped by user")
+
+	default:
+		fmt.Printf("Invalid choice '%s', please try again\n", choice)
+		return dm.promptForTemplateMerge(conflict)
+	}
+}
+
+// showDiff displays a side-by-side comparison of two contents
+func (dm *DotfilesManager) showDiff(content1, content2, label1, label2 string) {
+	fmt.Printf("\n=== DIFF: %s vs %s ===\n", label1, label2)
+
+	lines1 := strings.Split(content1, "\n")
+	lines2 := strings.Split(content2, "\n")
+
+	fmt.Printf("--- %s\n", label1)
+	fmt.Printf("+++ %s\n\n", label2)
+
+	maxLines := len(lines1)
+	if len(lines2) > maxLines {
+		maxLines = len(lines2)
+	}
+
+	diffCount := 0
+	for i := 0; i < maxLines && diffCount < 20; i++ {
+		var line1, line2 string
+		if i < len(lines1) {
+			line1 = lines1[i]
+		}
+		if i < len(lines2) {
+			line2 = lines2[i]
+		}
+
+		if line1 != line2 {
+			if line1 != "" {
+				fmt.Printf("-%s\n", line1)
+			}
+			if line2 != "" {
+				fmt.Printf("+%s\n", line2)
+			}
+			diffCount++
+		}
+	}
+
+	if diffCount >= 20 {
+		fmt.Println("... (showing first 20 differences)")
+	}
+	fmt.Println()
+}
+
+// showThreeWayDiff shows local, remote base, and template output
+func (dm *DotfilesManager) showThreeWayDiff(conflict TemplateMergeConflict) {
+	fmt.Println("\n=== THREE-WAY COMPARISON ===")
+
+	// Process remote template if available
+	var remoteTemplateOutput string
+	if conflict.RemoteTemplate != "" {
+		remoteTemplateOutput = dm.processTemplateContent(conflict.RemoteTemplate)
+	}
+
+	// Process current local template
+	templateContent, _ := os.ReadFile(conflict.TemplatePath)
+	currentTemplateOutput := dm.processTemplateContent(string(templateContent))
+
+	fmt.Println("\n[1] LOCAL CHANGES (current base file):")
+	fmt.Println("---")
+	dm.printPreview(conflict.LocalContent)
+
+	if conflict.RemoteBase != "" {
+		fmt.Println("\n[2] REMOTE BASE (from origin/main):")
+		fmt.Println("---")
+		dm.printPreview(conflict.RemoteBase)
+	}
+
+	if remoteTemplateOutput != "" {
+		fmt.Println("\n[3] REMOTE TEMPLATE OUTPUT (what origin/main template would generate):")
+		fmt.Println("---")
+		dm.printPreview(remoteTemplateOutput)
+	}
+
+	fmt.Println("\n[4] CURRENT TEMPLATE OUTPUT (what local template would generate):")
+	fmt.Println("---")
+	dm.printPreview(currentTemplateOutput)
+	fmt.Println()
+}
+
+// printPreview prints a preview of content (first 15 lines)
+func (dm *DotfilesManager) printPreview(content string) {
+	lines := strings.Split(content, "\n")
+	maxLines := 15
+	if len(lines) < maxLines {
+		maxLines = len(lines)
+	}
+
+	for i := 0; i < maxLines; i++ {
+		fmt.Printf("%3d: %s\n", i+1, lines[i])
+	}
+
+	if len(lines) > maxLines {
+		fmt.Printf("... (%d more lines)\n", len(lines)-maxLines)
+	}
+}
+
+// resolveTemplateConflicts resolves a list of template conflicts interactively
+func (dm *DotfilesManager) resolveTemplateConflicts(conflicts []TemplateMergeConflict) error {
+	fmt.Printf("\n=== RESOLVING TEMPLATE CONFLICTS ===\n")
+	fmt.Printf("You have %d template conflict(s) to resolve.\n\n", len(conflicts))
+
+	resolvedCount := 0
+	skippedCount := 0
+
+	for i, conflict := range conflicts {
+		fmt.Printf("\n[%d/%d] Resolving conflict for: %s\n", i+1, len(conflicts), conflict.BasePath)
+
+		resolvedContent, err := dm.promptForTemplateMerge(conflict)
+		if err != nil {
+			if err.Error() == "skipped by user" {
+				fmt.Printf("Skipped %s\n", conflict.BasePath)
+				skippedCount++
+				continue
+			}
+			return err
+		}
+
+		// Write resolved content to base file
+		if err := os.WriteFile(conflict.BasePath, []byte(resolvedContent), 0644); err != nil {
+			return fmt.Errorf("failed to write resolved content to %s: %w", conflict.BasePath, err)
+		}
+
+		// Stage the resolved file
+		relPath, _ := filepath.Rel(dm.DotfilesDir, conflict.BasePath)
+		if err := dm.runGitCommand("add", relPath); err != nil {
+			return fmt.Errorf("failed to stage resolved file: %w", err)
+		}
+
+		fmt.Printf("✓ Resolved and staged %s\n", conflict.BasePath)
+		resolvedCount++
+	}
+
+	fmt.Printf("\n=== RESOLUTION SUMMARY ===\n")
+	fmt.Printf("Resolved: %d\n", resolvedCount)
+	fmt.Printf("Skipped: %d\n", skippedCount)
+
+	if skippedCount > 0 {
+		fmt.Printf("\nWarning: %d conflict(s) were skipped. You may need to resolve them manually.\n", skippedCount)
+	}
+
+	return nil
+}
+
+// LineDiff represents a difference between template output and base file
+type LineDiff struct {
+	Type            string // "added", "removed", "modified"
+	BaseLineNum     int    // Line number in base file (0 if removed)
+	TemplateLineNum int    // Line number in template output (0 if added)
+	BaseContent     string // Content in base file
+	TemplateContent string // Content in template output
+}
+
+// TemplateSection represents a section in the template file
+type TemplateSection struct {
+	Type         string   // "conditional", "common"
+	System       string   // System name for conditional sections (empty for common)
+	StartLine    int      // Starting line in template
+	EndLine      int      // Ending line in template
+	Content      []string // Lines in this section
+	MatchedLines []string // Lines from base file that matched this section
+}
+
+// computeLineDiff compares base file with template output line by line
+func computeLineDiff(baseContent, templateOutput string) []LineDiff {
+	baseLines := strings.Split(baseContent, "\n")
+	templateLines := strings.Split(templateOutput, "\n")
+
+	var diffs []LineDiff
+
+	// Simple line-by-line comparison for now
+	// This can be enhanced with a proper diff algorithm (Myers, etc.)
+	maxLen := len(baseLines)
+	if len(templateLines) > maxLen {
+		maxLen = len(templateLines)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		var baseLine, templateLine string
+		if i < len(baseLines) {
+			baseLine = baseLines[i]
+		}
+		if i < len(templateLines) {
+			templateLine = templateLines[i]
+		}
+
+		if baseLine != templateLine {
+			if baseLine == "" {
+				// Line was removed from base
+				diffs = append(diffs, LineDiff{
+					Type:            "removed",
+					TemplateLineNum: i + 1,
+					TemplateContent: templateLine,
+				})
+			} else if templateLine == "" {
+				// Line was added to base
+				diffs = append(diffs, LineDiff{
+					Type:        "added",
+					BaseLineNum: i + 1,
+					BaseContent: baseLine,
+				})
+			} else {
+				// Line was modified
+				diffs = append(diffs, LineDiff{
+					Type:            "modified",
+					BaseLineNum:     i + 1,
+					TemplateLineNum: i + 1,
+					BaseContent:     baseLine,
+					TemplateContent: templateLine,
+				})
+			}
+		}
+	}
+
+	return diffs
+}
+
+// parseTemplateSections breaks down a template into sections
+func parseTemplateSections(templateContent string) []TemplateSection {
+	lines := strings.Split(templateContent, "\n")
+	var sections []TemplateSection
+	var currentSection *TemplateSection
+
+	// Start with a common section
+	currentSection = &TemplateSection{
+		Type:      "common",
+		StartLine: 1,
+		Content:   []string{},
+	}
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Check for conditional start
+		if strings.HasPrefix(trimmed, "{{#if ") && strings.HasSuffix(trimmed, "}}") {
+			// Save current section if it has content
+			if len(currentSection.Content) > 0 {
+				currentSection.EndLine = i
+				sections = append(sections, *currentSection)
+			}
+
+			// Start new conditional section
+			system := strings.TrimSpace(trimmed[6 : len(trimmed)-2])
+			currentSection = &TemplateSection{
+				Type:      "conditional",
+				System:    system,
+				StartLine: i + 1,
+				Content:   []string{},
+			}
+			continue
+		}
+
+		// Check for conditional end
+		if trimmed == "{{/if}}" {
+			// Save current conditional section
+			currentSection.EndLine = i
+			sections = append(sections, *currentSection)
+
+			// Start new common section
+			currentSection = &TemplateSection{
+				Type:      "common",
+				StartLine: i + 1,
+				Content:   []string{},
+			}
+			continue
+		}
+
+		// Add line to current section
+		currentSection.Content = append(currentSection.Content, line)
+	}
+
+	// Save final section
+	if len(currentSection.Content) > 0 {
+		currentSection.EndLine = len(lines)
+		sections = append(sections, *currentSection)
+	}
+
+	return sections
+}
+
+// smartMergeIntoTemplate intelligently merges base file changes into template
+func (dm *DotfilesManager) smartMergeIntoTemplate(conflict TemplateMergeConflict) error {
+	// Read template
+	templateContent, err := os.ReadFile(conflict.TemplatePath)
+	if err != nil {
+		return fmt.Errorf("failed to read template: %w", err)
+	}
+
+	// Check if template has conditionals
+	hasConditionals := strings.Contains(string(templateContent), "{{#if")
+
+	if !hasConditionals {
+		// No conditionals - simple replacement
+		fmt.Println("Template has no conditional blocks. Using direct replacement.")
+		return dm.replaceTemplateSimple(conflict)
+	}
+
+	// Parse template into sections
+	sections := parseTemplateSections(string(templateContent))
+
+	// Process template to get what it would generate for current system
+	templateOutput := dm.processTemplateContent(string(templateContent))
+
+	// Compute differences
+	diffs := computeLineDiff(conflict.LocalContent, templateOutput)
+
+	if len(diffs) == 0 {
+		fmt.Println("No differences detected between base file and template output.")
+		return nil
+	}
+
+	fmt.Printf("\n=== SMART MERGE ANALYSIS ===\n")
+	fmt.Printf("Found %d difference(s) between base file and template output\n", len(diffs))
+	fmt.Printf("Template has %d section(s):\n", len(sections))
+	for _, sec := range sections {
+		if sec.Type == "conditional" {
+			fmt.Printf("  - Conditional block for '%s' (%d lines)\n", sec.System, len(sec.Content))
+		} else {
+			fmt.Printf("  - Common section (%d lines)\n", len(sec.Content))
+		}
+	}
+	fmt.Println()
+
+	// Analyze where changes should go
+	analysis := dm.analyzeChangePlacement(diffs, sections, templateOutput)
+
+	// Show analysis and ask for confirmation
+	fmt.Println("Change placement analysis:")
+	for i, change := range analysis {
+		fmt.Printf("%d. ", i+1)
+		if change.Type == "added" {
+			fmt.Printf("ADD: %s\n", truncate(change.BaseContent, 60))
+		} else if change.Type == "modified" {
+			fmt.Printf("MODIFY: %s -> %s\n",
+				truncate(change.TemplateContent, 30),
+				truncate(change.BaseContent, 30))
+		} else {
+			fmt.Printf("REMOVE: %s\n", truncate(change.TemplateContent, 60))
+		}
+
+		if change.RecommendedSection != nil {
+			if change.RecommendedSection.Type == "conditional" {
+				fmt.Printf("   → Suggested: Add to conditional block for '%s'\n", change.RecommendedSection.System)
+			} else {
+				fmt.Printf("   → Suggested: Add to common section\n")
+			}
+		} else {
+			fmt.Printf("   → Suggested: Add to common section (default)\n")
+		}
+	}
+
+	fmt.Println("\nOptions:")
+	fmt.Println("  1. Auto-merge (apply all suggestions)")
+	fmt.Println("  2. Manual edit (I'll help you place changes)")
+	fmt.Println("  3. Cancel")
+	fmt.Print("\nChoice [1-3]: ")
+
+	var choice string
+	fmt.Scanln(&choice)
+
+	switch strings.TrimSpace(choice) {
+	case "1":
+		return dm.autoMergeTemplate(conflict, sections, analysis)
+	case "2":
+		return dm.editTemplateManually(conflict)
+	case "3", "":
+		return fmt.Errorf("cancelled by user")
+	default:
+		fmt.Println("Invalid choice")
+		return dm.smartMergeIntoTemplate(conflict)
+	}
+}
+
+// ChangePlacement represents where a change should go in the template
+type ChangePlacement struct {
+	LineDiff
+	RecommendedSection *TemplateSection
+	Confidence         string // "high", "medium", "low"
+}
+
+// analyzeChangePlacement determines where each change should go in the template
+func (dm *DotfilesManager) analyzeChangePlacement(diffs []LineDiff, sections []TemplateSection, templateOutput string) []ChangePlacement {
+	var placements []ChangePlacement
+
+	templateLines := strings.Split(templateOutput, "\n")
+
+	for _, diff := range diffs {
+		placement := ChangePlacement{
+			LineDiff:   diff,
+			Confidence: "medium",
+		}
+
+		// Find which section this line is in (in the template output)
+		if diff.TemplateLineNum > 0 && diff.TemplateLineNum <= len(templateLines) {
+			// Find the corresponding section
+			lineNum := diff.TemplateLineNum
+			cumulativeLine := 0
+
+			for i := range sections {
+				sectionLen := len(sections[i].Content)
+				if lineNum <= cumulativeLine+sectionLen {
+					placement.RecommendedSection = &sections[i]
+					placement.Confidence = "high"
+					break
+				}
+				cumulativeLine += sectionLen
+			}
+		}
+
+		// If we couldn't determine section (e.g., new line), default to common
+		if placement.RecommendedSection == nil {
+			// Find the last common section
+			for i := len(sections) - 1; i >= 0; i-- {
+				if sections[i].Type == "common" {
+					placement.RecommendedSection = &sections[i]
+					placement.Confidence = "low"
+					break
+				}
+			}
+		}
+
+		placements = append(placements, placement)
+	}
+
+	return placements
+}
+
+// autoMergeTemplate automatically applies changes to the template
+func (dm *DotfilesManager) autoMergeTemplate(conflict TemplateMergeConflict, sections []TemplateSection, placements []ChangePlacement) error {
+	// Read template
+	templateContent, err := os.ReadFile(conflict.TemplatePath)
+	if err != nil {
+		return fmt.Errorf("failed to read template: %w", err)
+	}
+
+	templateLines := strings.Split(string(templateContent), "\n")
+
+	// Apply changes section by section
+	for _, placement := range placements {
+		if placement.Type == "added" {
+			// Find where to insert this line in the template
+			if placement.RecommendedSection != nil {
+				// Insert at end of recommended section
+				insertPos := placement.RecommendedSection.EndLine
+
+				// Handle conditional sections - insert before {{/if}}
+				if placement.RecommendedSection.Type == "conditional" {
+					insertPos-- // Insert before the {{/if}} line
+				}
+
+				// Insert the new line
+				templateLines = insertLine(templateLines, insertPos, placement.BaseContent)
+
+				// Update section end lines for subsequent sections
+				for i := range sections {
+					if sections[i].StartLine > insertPos {
+						sections[i].StartLine++
+						sections[i].EndLine++
+					} else if sections[i].EndLine >= insertPos {
+						sections[i].EndLine++
+					}
+				}
+			}
+		} else if placement.Type == "modified" {
+			// Find and replace the line in the template
+			// This requires mapping from template output line to template file line
+			// For now, we'll search for the content
+			for i, line := range templateLines {
+				if strings.TrimSpace(line) == strings.TrimSpace(placement.TemplateContent) {
+					templateLines[i] = placement.BaseContent
+					break
+				}
+			}
+		}
+		// "removed" type: we don't remove lines from template, user can do that manually
+	}
+
+	// Write updated template
+	newTemplateContent := strings.Join(templateLines, "\n")
+	if err := os.WriteFile(conflict.TemplatePath, []byte(newTemplateContent), 0644); err != nil {
+		return fmt.Errorf("failed to write template: %w", err)
+	}
+
+	// Stage the template file
+	relPath, _ := filepath.Rel(dm.DotfilesDir, conflict.TemplatePath)
+	if err := dm.runGitCommand("add", relPath); err != nil {
+		fmt.Printf("Warning: Failed to stage template file: %v\n", err)
+	}
+
+	fmt.Printf("✓ Auto-merged changes into template: %s\n", conflict.TemplatePath)
+	return nil
+}
+
+// insertLine inserts a line at the specified position
+func insertLine(lines []string, pos int, content string) []string {
+	if pos >= len(lines) {
+		return append(lines, content)
+	}
+
+	lines = append(lines[:pos+1], lines[pos:]...)
+	lines[pos] = content
+	return lines
+}
+
+// truncate truncates a string to maxLen characters
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
+// replaceTemplateSimple replaces template content with base file content
+func (dm *DotfilesManager) replaceTemplateSimple(conflict TemplateMergeConflict) error {
+	fmt.Println("\n⚠️  This will replace the template file content with your base file changes.")
+	fmt.Print("Continue? [y/N]: ")
+
+	var response string
+	fmt.Scanln(&response)
+	if strings.ToLower(strings.TrimSpace(response)) != "y" {
+		fmt.Println("Cancelled.")
+		return fmt.Errorf("cancelled by user")
+	}
+
+	// Write base file content to template
+	if err := os.WriteFile(conflict.TemplatePath, []byte(conflict.LocalContent), 0644); err != nil {
+		return fmt.Errorf("failed to update template: %w", err)
+	}
+
+	// Stage the template file
+	relPath, _ := filepath.Rel(dm.DotfilesDir, conflict.TemplatePath)
+	if err := dm.runGitCommand("add", relPath); err != nil {
+		fmt.Printf("Warning: Failed to stage template file: %v\n", err)
+	}
+
+	fmt.Printf("✓ Updated template: %s\n", conflict.TemplatePath)
+	return nil
+}
+
+// mergeIntoTemplateInteractive intelligently merges base file changes into template
+// while preserving existing conditional blocks
+func (dm *DotfilesManager) mergeIntoTemplateInteractive(conflict TemplateMergeConflict) error {
+	templateContent, err := os.ReadFile(conflict.TemplatePath)
+	if err != nil {
+		return fmt.Errorf("failed to read template: %w", err)
+	}
+
+	fmt.Println("\n=== INTERACTIVE TEMPLATE UPDATE ===")
+	fmt.Println("This will help you merge changes from the base file into the template")
+	fmt.Println("while preserving conditional blocks.")
+	fmt.Println()
+
+	// Check if template has conditional blocks
+	hasConditionals := strings.Contains(string(templateContent), "{{#if")
+
+	if !hasConditionals {
+		fmt.Println("Template has no conditional blocks. Using direct replacement.")
+		return dm.replaceTemplateSimple(conflict)
+	}
+
+	fmt.Println("Template structure:")
+	dm.analyzeTemplateStructure(string(templateContent))
+	fmt.Println()
+
+	fmt.Println("Options:")
+	fmt.Println("  1. Edit template manually to merge changes")
+	fmt.Println("  2. Show base file content (to help with manual edit)")
+	fmt.Println("  3. Replace entire template (lose conditionals)")
+	fmt.Println("  4. Cancel")
+	fmt.Print("\nChoice [1-4]: ")
+
+	var choice string
+	fmt.Scanln(&choice)
+	choice = strings.TrimSpace(choice)
+
+	switch choice {
+	case "1":
+		// Open template for editing
+		return dm.editTemplateManually(conflict)
+
+	case "2":
+		// Show base content first, then ask again
+		fmt.Println("\n=== BASE FILE CONTENT ===")
+		dm.printPreview(conflict.LocalContent)
+		fmt.Println("\nPress Enter to continue...")
+		fmt.Scanln()
+		return dm.mergeIntoTemplateInteractive(conflict)
+
+	case "3":
+		// Replace template completely
+		return dm.replaceTemplateSimple(conflict)
+
+	case "4", "":
+		return fmt.Errorf("cancelled by user")
+
+	default:
+		fmt.Printf("Invalid choice '%s'\n", choice)
+		return dm.mergeIntoTemplateInteractive(conflict)
+	}
+}
+
+// analyzeTemplateStructure shows the structure of a template file
+func (dm *DotfilesManager) analyzeTemplateStructure(templateContent string) {
+	lines := strings.Split(templateContent, "\n")
+	inConditional := false
+	currentSystem := ""
+	conditionalLines := 0
+	commonLines := 0
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "{{#if ") && strings.HasSuffix(trimmed, "}}") {
+			currentSystem = strings.TrimSpace(trimmed[6 : len(trimmed)-2])
+			inConditional = true
+			conditionalLines = 0
+			continue
+		}
+
+		if trimmed == "{{/if}}" {
+			if inConditional {
+				fmt.Printf("  - %d lines for system: %s\n", conditionalLines, currentSystem)
+			}
+			inConditional = false
+			continue
+		}
+
+		if inConditional {
+			conditionalLines++
+		} else if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			commonLines++
+		}
+	}
+
+	fmt.Printf("  - %d common lines (not in conditionals)\n", commonLines)
+}
+
+// editTemplateManually opens the template in an editor for manual updates
+func (dm *DotfilesManager) editTemplateManually(conflict TemplateMergeConflict) error {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vim"
+	}
+
+	// Create a helper file with base content for reference
+	helperFile := conflict.TemplatePath + ".base-reference"
+	helperContent := fmt.Sprintf(`# REFERENCE: Base file content (your changes)
+# Copy relevant lines from here into the template file
+# This file will be deleted after you close the editor
+# Template file is: %s
+
+%s`, conflict.TemplatePath, conflict.LocalContent)
+
+	if err := os.WriteFile(helperFile, []byte(helperContent), 0644); err != nil {
+		fmt.Printf("Warning: Could not create reference file: %v\n", err)
+	} else {
+		defer os.Remove(helperFile)
+	}
+
+	fmt.Printf("\nOpening template in %s...\n", editor)
+	if helperFile != "" {
+		fmt.Printf("Reference file (base content) opened in split: %s\n", helperFile)
+		fmt.Println("\nTips:")
+		fmt.Println("  - Look for {{#if system}} blocks in the template")
+		fmt.Println("  - Merge your changes from the reference file")
+		fmt.Println("  - Keep conditional blocks intact")
+		fmt.Println("  - Common content goes outside conditionals")
+		fmt.Println("\nPress Enter to open editor...")
+		fmt.Scanln()
+	}
+
+	// Open both files in editor (vim supports this with -O for vertical split)
+	var cmd *exec.Cmd
+	if editor == "vim" || editor == "nvim" {
+		cmd = exec.Command(editor, "-O", conflict.TemplatePath, helperFile)
+	} else {
+		// For other editors, just open the template
+		cmd = exec.Command(editor, conflict.TemplatePath)
+	}
+
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("editor failed: %w", err)
+	}
+
+	// Stage the updated template
+	relPath, _ := filepath.Rel(dm.DotfilesDir, conflict.TemplatePath)
+	if err := dm.runGitCommand("add", relPath); err != nil {
+		fmt.Printf("Warning: Failed to stage template: %v\n", err)
+	}
+
+	fmt.Printf("✓ Template updated: %s\n", conflict.TemplatePath)
+	return nil
+}
+
+// manualEditMerge opens an editor for manual conflict resolution
+func (dm *DotfilesManager) manualEditMerge(conflict TemplateMergeConflict) (string, error) {
+	// Create a temporary file with merge markers
+	tempFile := conflict.BasePath + ".merge"
+
+	// Get template output
+	templateContent, _ := os.ReadFile(conflict.TemplatePath)
+	templateOutput := dm.processTemplateContent(string(templateContent))
+
+	// Create merge file with conflict markers
+	mergeContent := fmt.Sprintf(`<<<<<<< LOCAL (your changes)
+%s
+=======
+%s
+>>>>>>> TEMPLATE (generated from %s)
+
+# Instructions:
+# 1. Resolve the conflict by editing the content above
+# 2. Remove the conflict markers (<<<<<<, =======, >>>>>>>)
+# 3. Save and close the editor
+# 4. The resolved content will be used
+`, conflict.LocalContent, templateOutput, filepath.Base(conflict.TemplatePath))
+
+	if err := os.WriteFile(tempFile, []byte(mergeContent), 0644); err != nil {
+		return "", fmt.Errorf("failed to create merge file: %w", err)
+	}
+
+	defer os.Remove(tempFile) // Clean up temp file
+
+	// Open editor
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vim" // Default to vim
+	}
+
+	fmt.Printf("Opening %s for manual merge...\n", editor)
+	cmd := exec.Command(editor, tempFile)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("editor failed: %w", err)
+	}
+
+	// Read the resolved content
+	resolvedContent, err := os.ReadFile(tempFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to read resolved content: %w", err)
+	}
+
+	// Check if conflict markers are still present
+	if strings.Contains(string(resolvedContent), "<<<<<<<") ||
+		strings.Contains(string(resolvedContent), "=======") ||
+		strings.Contains(string(resolvedContent), ">>>>>>>") {
+		fmt.Println("Warning: Conflict markers still present in file")
+		fmt.Print("Continue anyway? [y/N]: ")
+		var response string
+		fmt.Scanln(&response)
+		if strings.ToLower(strings.TrimSpace(response)) != "y" {
+			return dm.promptForTemplateMerge(conflict)
+		}
+	}
+
+	return string(resolvedContent), nil
+}
+
 func (dm *DotfilesManager) getTemplateOverwriteMessage() string {
 	if len(templateOverwrites) == 0 {
 		return ""
@@ -1385,13 +2319,58 @@ func (dm *DotfilesManager) syncToGitHub(dryRun bool) error {
 			// Check if it's a merge conflict
 			if dm.hasMergeConflicts() {
 				fmt.Printf("⚠️  Merge conflicts detected after restoring local changes.\n")
-				fmt.Printf("Please resolve conflicts manually and run 'dotctl sync' again.\n")
-				fmt.Printf("Conflicted files can be found with: git status\n")
-				return fmt.Errorf("merge conflicts detected - manual resolution required")
+
+				// Check for template-related conflicts
+				templateConflicts, err := dm.detectTemplateMergeConflicts()
+				if err != nil {
+					fmt.Printf("Error detecting template conflicts: %v\n", err)
+					fmt.Printf("Please resolve conflicts manually and run 'dotctl sync' again.\n")
+					return fmt.Errorf("merge conflicts detected - manual resolution required")
+				}
+
+				if len(templateConflicts) > 0 {
+					fmt.Printf("Found %d template-related conflicts that can be resolved interactively.\n", len(templateConflicts))
+					fmt.Print("Resolve conflicts interactively? [Y/n]: ")
+					var response string
+					fmt.Scanln(&response)
+
+					if strings.ToLower(strings.TrimSpace(response)) != "n" {
+						// Resolve template conflicts interactively
+						if err := dm.resolveTemplateConflicts(templateConflicts); err != nil {
+							return fmt.Errorf("failed to resolve template conflicts: %w", err)
+						}
+					} else {
+						fmt.Printf("Please resolve conflicts manually and run 'dotctl sync' again.\n")
+						return fmt.Errorf("merge conflicts detected - manual resolution required")
+					}
+				} else {
+					fmt.Printf("Please resolve conflicts manually and run 'dotctl sync' again.\n")
+					fmt.Printf("Conflicted files can be found with: git status\n")
+					return fmt.Errorf("merge conflicts detected - manual resolution required")
+				}
 			}
 			return fmt.Errorf("failed to restore stashed changes: %w", err)
 		}
 		fmt.Printf("✓ Successfully restored local changes\n")
+	}
+
+	// Step 6.5: Check for template conflicts even without git merge conflicts
+	// This handles cases where template and base file diverged locally
+	fmt.Printf("Checking for template conflicts...\n")
+	templateConflicts, err := dm.detectTemplateMergeConflicts()
+	if err != nil {
+		fmt.Printf("Warning: Error checking for template conflicts: %v\n", err)
+	} else if len(templateConflicts) > 0 {
+		fmt.Printf("Found %d template files with local modifications.\n", len(templateConflicts))
+		fmt.Print("Review and resolve template conflicts? [Y/n]: ")
+		var response string
+		fmt.Scanln(&response)
+
+		if strings.ToLower(strings.TrimSpace(response)) != "n" {
+			if err := dm.resolveTemplateConflicts(templateConflicts); err != nil {
+				return fmt.Errorf("failed to resolve template conflicts: %w", err)
+			}
+		}
 	}
 
 	// Step 7: Add all files (including any resolved conflicts or new changes)
@@ -1745,8 +2724,10 @@ Commands:
   remove <package>        Remove package from configuration
   adopt [package] [systems...]  Adopt config directories from ~/.config (default: all packages, all systems)
   template-history        Show commits where template files were overwritten
+  merge-check             Check for template merge conflicts without syncing
+  merge-resolve           Interactively resolve template merge conflicts
   github-repo <owner/repo> [branch] Set GitHub repository for sync
-  sync                    Sync dotfiles to GitHub repository
+  sync                    Sync dotfiles to GitHub repository (with merge detection)
   pull                    Pull dotfiles from GitHub repository
 
 Options:
@@ -1770,11 +2751,38 @@ Examples:
   dotctl adopt new-app arch        # Adopt specific package for specific systems
   dotctl --dry-run adopt           # Preview what would be adopted
   dotctl template-history          # Show commits with template overwrites
+  dotctl merge-check               # Check for template conflicts
+  dotctl merge-resolve             # Resolve template conflicts interactively
   dotctl github-repo user/dotfiles # Set GitHub repository
-  dotctl sync                      # Push dotfiles to GitHub
+  dotctl sync                      # Push dotfiles to GitHub (auto-detects merges)
   dotctl pull                      # Pull dotfiles from GitHub
   dotctl --dry-run deploy          # Show what would be deployed
-  dotctl --interactive deploy      # Deploy with prompts for template conflicts`)
+  dotctl --interactive deploy      # Deploy with prompts for template conflicts
+
+Template Merging:
+  When base config files are manually edited and template files are updated,
+  dotctl can detect conflicts and help you merge changes interactively:
+  
+  - Use 'merge-check' to see if there are any conflicts
+  - Use 'merge-resolve' to interactively resolve conflicts
+  - During 'sync', conflicts are automatically detected and can be resolved
+  
+  The interactive merge provides options to:
+  1. Keep local changes in base file only (don't update template)
+  2. Use template output (discard local changes)
+  3. Smart merge into template (analyzes changes, preserves conditionals, auto-merge)
+  4. Merge base changes into template interactively (manual editing with assistance)
+  5. View diffs between versions
+  6. Perform three-way merge (local | remote | template)
+  7. Manual edit base file with merge markers
+  8. Skip individual files
+  
+  Option 3 intelligently:
+  - Parses template sections (conditional blocks vs common sections)
+  - Detects added/modified/removed lines
+  - Determines where each change belongs
+  - Can auto-merge or let you review placements
+  - Preserves all {{#if system}} conditional blocks`)
 }
 
 func main() {
@@ -1879,6 +2887,53 @@ func main() {
 		if err := manager.showTemplateHistory(); err != nil {
 			fmt.Printf("Error showing template history: %v\n", err)
 			os.Exit(1)
+		}
+
+	case "merge-check":
+		conflicts, err := manager.detectTemplateMergeConflicts()
+		if err != nil {
+			fmt.Printf("Error checking for template conflicts: %v\n", err)
+			os.Exit(1)
+		}
+
+		if len(conflicts) == 0 {
+			fmt.Println("✓ No template merge conflicts detected")
+		} else {
+			fmt.Printf("Found %d template merge conflict(s):\n\n", len(conflicts))
+			for i, conflict := range conflicts {
+				fmt.Printf("%d. %s\n", i+1, conflict.BasePath)
+				fmt.Printf("   Template: %s\n", conflict.TemplatePath)
+
+				// Show brief summary of differences
+				templateContent, _ := os.ReadFile(conflict.TemplatePath)
+				templateOutput := manager.processTemplateContent(string(templateContent))
+
+				localLines := len(strings.Split(conflict.LocalContent, "\n"))
+				templateLines := len(strings.Split(templateOutput, "\n"))
+				fmt.Printf("   Local: %d lines, Template would generate: %d lines\n\n", localLines, templateLines)
+			}
+
+			fmt.Printf("Run 'dotctl merge-resolve' to interactively resolve these conflicts\n")
+		}
+
+	case "merge-resolve":
+		conflicts, err := manager.detectTemplateMergeConflicts()
+		if err != nil {
+			fmt.Printf("Error detecting template conflicts: %v\n", err)
+			os.Exit(1)
+		}
+
+		if len(conflicts) == 0 {
+			fmt.Println("✓ No template merge conflicts to resolve")
+		} else {
+			if err := manager.resolveTemplateConflicts(conflicts); err != nil {
+				fmt.Printf("Error resolving template conflicts: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Println("\n✓ Template conflicts resolved")
+			fmt.Println("Run 'git status' to see staged changes")
+			fmt.Println("Run 'dotctl sync' to commit and push changes")
 		}
 
 	case "github-repo":

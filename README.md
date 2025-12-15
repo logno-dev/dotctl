@@ -470,10 +470,310 @@ dotctl can sync your dotfiles to and from GitHub repositories using the GitHub C
   2. **Stashes local changes** if needed before pulling upstream updates
   3. **Pulls upstream changes** and merges them with your local repository
   4. **Restores local changes** and handles any merge conflicts
-  5. **Commits and pushes** your changes to the remote repository
+  5. **Detects template conflicts** between template files and base config files
+  6. **Commits and pushes** your changes to the remote repository
 - `dotctl pull` pulls the latest changes from the configured branch
 - If the dotfiles directory doesn't exist when pulling, it will clone the repository
 - **Merge conflict handling**: If conflicts occur during sync, dotctl will notify you and provide guidance for manual resolution
+
+## Template Merging
+
+When working with templates, you might encounter situations where:
+- You've manually edited a generated base config file (e.g., `.zshrc`)
+- The template file (e.g., `.zshrc.template`) has been updated remotely
+- Both files have conflicting changes that need to be merged
+
+dotctl provides an intelligent merge system to handle these conflicts interactively.
+
+### Understanding Template Conflicts
+
+A template conflict occurs when:
+1. A `.template` file exists (e.g., `shell/.zshrc.template`)
+2. The generated base file exists (e.g., `shell/.zshrc`)
+3. The base file has been manually edited
+4. The template would generate different content than what's in the base file
+
+This commonly happens when:
+- You make quick edits to the generated config file instead of the template
+- Remote changes to the template haven't been merged with your local edits
+- Different systems have diverged in their configurations
+
+### Checking for Template Conflicts
+
+Before syncing, you can check if there are any template conflicts:
+
+```bash
+dotctl merge-check
+```
+
+This will scan all packages and report any conflicts between template files and their generated base files, showing:
+- Which files have conflicts
+- The location of the template and base files
+- Line count differences
+
+### Resolving Template Conflicts
+
+To interactively resolve template conflicts:
+
+```bash
+dotctl merge-resolve
+```
+
+For each conflict, you'll be presented with 8 options:
+
+#### Option 1: Keep Local Changes in Base File
+Keeps your manually edited base file as-is, ignoring the template. Use this when:
+- Your local edits are exactly what you want
+- The template changes aren't relevant to your setup
+- You plan to update the template later to match your edits
+- **Note**: This doesn't update the template, so the divergence will persist
+
+#### Option 2: Use Template Output
+Discards your local edits and uses the template-generated content. Use this when:
+- The template is the source of truth
+- Your local edits were temporary or experimental
+- Remote template changes should override local modifications
+
+#### Option 3: Update Template with Base File Changes (Smart Merge)
+**This is the key feature for propagating changes back to the template!**
+
+Intelligently analyzes your changes and merges them into the template while preserving conditional blocks:
+
+**How it works:**
+1. **Parses template structure**: Identifies all `{{#if system}}` blocks and common sections
+2. **Compares line-by-line**: Detects what lines were added, removed, or modified
+3. **Maps changes to sections**: Determines which template section each change belongs to
+4. **Shows analysis**: Displays where each change will be placed
+5. **Offers auto-merge or manual edit**
+
+**Example:**
+```
+=== SMART MERGE ANALYSIS ===
+Found 3 difference(s) between base file and template output
+Template has 3 section(s):
+  - Conditional block for 'macos' (5 lines)
+  - Common section (12 lines)
+  - Conditional block for 'linux' (4 lines)
+
+Change placement analysis:
+1. ADD: alias myalias='echo hello'
+   → Suggested: Add to common section
+2. MODIFY: alias ll='ls -la' -> alias ll='ls -laF'
+   → Suggested: Add to common section
+3. ADD: export HOMEBREW_NO_ANALYTICS=1
+   → Suggested: Add to conditional block for 'macos'
+
+Options:
+  1. Auto-merge (apply all suggestions)
+  2. Manual edit (I'll help you place changes)
+  3. Cancel
+```
+
+**Auto-merge** will:
+- Insert new lines in the recommended sections
+- Update modified lines in place
+- Preserve all conditional blocks
+- Maintain template structure
+
+If template has no conditionals, it offers simple replacement instead.
+
+#### Option 4: Merge Base Changes into Template Interactively
+**The smart way to update templates with conditional blocks!**
+
+Opens an interactive workflow to help you merge base file changes into the template while preserving conditional blocks:
+
+1. Analyzes the template structure and shows:
+   - How many lines are in conditional blocks for each system
+   - How many common lines exist outside conditionals
+
+2. Presents sub-options:
+   - **Edit template manually**: Opens your editor with the template and a reference file containing your base file changes side-by-side (in vim/nvim)
+   - **Show base file content**: View your base file changes to help with manual editing
+   - **Replace entire template**: Same as Option 3 (lose conditionals)
+   - **Cancel**: Return to main menu
+
+When editing manually:
+- The template opens in your `$EDITOR` (vim opens with vertical split)
+- A reference file shows your base file changes
+- You manually copy relevant changes into the appropriate sections
+- Conditional blocks (`{{#if system}}`) are preserved
+- Common changes go outside conditional blocks
+
+#### Option 5: Show Diff
+Displays a side-by-side comparison of:
+- Your local changes (current base file)
+- What the template would generate
+
+This helps you understand what's different before making a decision.
+
+#### Option 6: Three-Way Merge View
+Shows a comprehensive comparison of all versions:
+1. **Local changes** - Your current base file
+2. **Remote base** - The base file from origin/main (if available)
+3. **Remote template output** - What the remote template would generate
+4. **Current template output** - What your local template would generate
+
+This is the most informative option when both local and remote changes exist.
+
+#### Option 7: Manual Edit Base File
+Opens your `$EDITOR` (defaults to vim) with merge conflict markers for the base file:
+
+```bash
+<<<<<<< LOCAL (your changes)
+# Your local edits
+export PATH="/custom/path:$PATH"
+=======
+# Template-generated content
+export PATH="/opt/homebrew/bin:$PATH"
+>>>>>>> TEMPLATE (generated from .zshrc.template)
+```
+
+Edit the file to resolve the conflict, remove the markers, and save. This gives you complete control to:
+- Combine changes from both versions
+- Cherry-pick specific lines
+- Add new content
+- Carefully craft the final result
+
+**Note**: This only edits the base file, not the template. Consider using Option 4 to update the template as well.
+
+#### Option 8: Skip
+Skips this particular file for now. Use this when:
+- You need more time to decide
+- You want to handle the conflict manually later
+- You're not sure which option is best yet
+
+### Automatic Merge Detection During Sync
+
+Template conflict detection is automatically integrated into the sync workflow:
+
+```bash
+dotctl sync
+```
+
+During sync, if template conflicts are detected:
+1. You'll be prompted to resolve them interactively
+2. Each resolved conflict is automatically staged for commit
+3. After all conflicts are resolved, sync continues normally
+4. Changes are committed and pushed to GitHub
+
+You can decline the interactive resolution and handle conflicts manually:
+
+```bash
+# When prompted during sync:
+Resolve conflicts interactively? [Y/n]: n
+```
+
+### Best Practices
+
+1. **Edit templates, not base files**: Always edit the `.template` file, not the generated file
+2. **Check before sync**: Run `dotctl merge-check` before `dotctl sync` to catch conflicts early
+3. **Use three-way merge**: When in doubt, view all versions with option 4
+4. **Keep templates in sync**: Regularly merge local edits back into templates
+5. **Document template changes**: Add comments explaining system-specific sections
+
+### Example Workflow: Simple Template (No Conditionals)
+
+```bash
+# You've edited ~/.bashrc directly instead of the template
+vim ~/.bashrc
+# Added: alias myalias='echo hello'
+
+# Check for conflicts
+dotctl merge-check
+# Found 1 template merge conflict(s):
+# 1. ~/.dotfiles/shell/.bashrc
+
+# Resolve conflicts and update template (smart merge)
+dotctl merge-resolve
+# [1/1] Resolving conflict for: ~/.dotfiles/shell/.bashrc
+# Options:
+#   3. Update template with base file changes (propagate changes)
+# Choice [1-8]: 3
+
+# Template has no conditional blocks. Using direct replacement.
+# ⚠️  This will replace the template file content...
+# Continue? [y/N]: y
+# ✓ Updated template: ~/.dotfiles/shell/.bashrc.template
+# ✓ Resolved and staged ~/.dotfiles/shell/.bashrc
+
+# Now sync your changes
+dotctl sync
+# ✓ Successfully synced with GitHub
+```
+
+### Example Workflow: Smart Auto-Merge (With Conditionals)
+
+```bash
+# You have a template with system-specific sections
+cat ~/.dotfiles/shell/.zshrc.template
+# {{#if macos}}
+# export PATH="/opt/homebrew/bin:$PATH"
+# {{/if}}
+# {{#if linux}}
+# export PATH="/usr/local/bin:$PATH"
+# {{/if}}
+# alias ll='ls -la'
+
+# You edited the base file directly on macOS
+vim ~/.zshrc
+# Added: alias myalias='echo hello'
+# Changed: alias ll='ls -laF'  (added F flag)
+# Added: export HOMEBREW_NO_ANALYTICS=1
+
+# Resolve with smart merge
+dotctl merge-resolve
+# [1/1] Resolving conflict for: ~/.dotfiles/shell/.zshrc
+# Choice [1-8]: 3  (Update template with base file changes)
+
+# === SMART MERGE ANALYSIS ===
+# Found 3 difference(s) between base file and template output
+# Template has 3 section(s):
+#   - Conditional block for 'macos' (1 lines)
+#   - Common section (1 lines)
+#   - Conditional block for 'linux' (1 lines)
+#
+# Change placement analysis:
+# 1. ADD: alias myalias='echo hello'
+#    → Suggested: Add to common section
+# 2. MODIFY: alias ll='ls -la' -> alias ll='ls -laF'
+#    → Suggested: Add to common section (high confidence)
+# 3. ADD: export HOMEBREW_NO_ANALYTICS=1
+#    → Suggested: Add to conditional block for 'macos' (high confidence)
+#
+# Options:
+#   1. Auto-merge (apply all suggestions)
+#   2. Manual edit (I'll help you place changes)
+#   3. Cancel
+# Choice [1-3]: 1
+
+# ✓ Auto-merged changes into template: ~/.dotfiles/shell/.zshrc.template
+# ✓ Resolved and staged ~/.dotfiles/shell/.zshrc
+
+# Result:
+cat ~/.dotfiles/shell/.zshrc.template
+# {{#if macos}}
+# export PATH="/opt/homebrew/bin:$PATH"
+# export HOMEBREW_NO_ANALYTICS=1    # ← Auto-added here!
+# {{/if}}
+# {{#if linux}}
+# export PATH="/usr/local/bin:$PATH"
+# {{/if}}
+# alias ll='ls -laF'                 # ← Auto-modified!
+# alias myalias='echo hello'         # ← Auto-added here!
+
+# Conditionals preserved, changes intelligently placed!
+```
+
+### Under the Hood
+
+The merge system:
+- Detects template files (`.template` extension)
+- Processes templates with system-specific conditions
+- Compares processed output with actual base files
+- Identifies differences and creates conflict records
+- Fetches remote versions from git for three-way comparison
+- Stages resolved files automatically
+- Integrates seamlessly with the sync workflow
 
 ## Directory Structure
 
