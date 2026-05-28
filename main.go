@@ -2215,6 +2215,39 @@ func (dm *DotfilesManager) setGitHubRepo(repository, branch string) error {
 	return nil
 }
 
+func (dm *DotfilesManager) bootstrapFromGitHub(repository, branch string, dryRun bool, interactive bool) error {
+	if dryRun {
+		if branch == "" {
+			branch = "main"
+		}
+		fmt.Printf("DRY RUN: Would set GitHub repository to %s (branch: %s)\n", repository, branch)
+		fmt.Printf("DRY RUN: Would pull dotfiles from GitHub\n")
+		fmt.Printf("DRY RUN: Would reload configuration from pulled repository\n")
+		fmt.Printf("DRY RUN: Would deploy packages for current system (%s)\n", dm.System)
+		return nil
+	}
+
+	if err := dm.setGitHubRepo(repository, branch); err != nil {
+		return fmt.Errorf("failed to save GitHub repository settings: %w", err)
+	}
+
+	if err := dm.pullFromGitHub(false); err != nil {
+		return fmt.Errorf("failed to pull repository during bootstrap: %w", err)
+	}
+
+	updatedConfig, err := dm.loadConfig()
+	if err != nil {
+		return fmt.Errorf("failed to reload configuration after pull: %w", err)
+	}
+	dm.Config = updatedConfig
+
+	fmt.Printf("Deploying pulled dotfiles for %s...\n", dm.System)
+	dm.deployAllWithOptions(nil, false, interactive)
+
+	fmt.Printf("\n✓ Bootstrap complete. Repository configured, pulled, and deployed.\n")
+	return nil
+}
+
 func (dm *DotfilesManager) syncToGitHub(dryRun bool) error {
 	if dm.Config.GitHub == nil || dm.Config.GitHub.Repository == "" {
 		return fmt.Errorf("no GitHub repository configured. Use 'dotctl github-repo <owner/repo>' first")
@@ -2427,20 +2460,40 @@ func (dm *DotfilesManager) pullFromGitHub(dryRun bool) error {
 		if dryRun {
 			fmt.Printf("DRY RUN: Would clone repository %s to %s\n", dm.Config.GitHub.Repository, dm.DotfilesDir)
 		} else {
-			fmt.Printf("Cloning repository %s...\n", dm.Config.GitHub.Repository)
+			fmt.Printf("Setting up repository %s...\n", dm.Config.GitHub.Repository)
 			repoURL := fmt.Sprintf("https://github.com/%s.git", dm.Config.GitHub.Repository)
 
-			// Clone to a temporary directory first, then move contents
-			tempDir := dm.DotfilesDir + ".tmp"
-			cmd := exec.Command("git", "clone", repoURL, tempDir)
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("failed to clone repository: %w", err)
+			// Ensure target directory exists for first-time bootstrap.
+			if err := os.MkdirAll(dm.DotfilesDir, 0755); err != nil {
+				return fmt.Errorf("failed to create dotfiles directory: %w", err)
 			}
 
-			// Move contents from temp directory to dotfiles directory
-			if err := os.Rename(tempDir, dm.DotfilesDir); err != nil {
-				return fmt.Errorf("failed to move cloned repository: %w", err)
+			// Initialize and merge remote branch into existing directory.
+			if err := dm.runGitCommand("init"); err != nil {
+				return fmt.Errorf("failed to initialize git repository: %w", err)
 			}
+			if err := dm.runGitCommand("remote", "add", "origin", repoURL); err != nil {
+				return fmt.Errorf("failed to add remote origin: %w", err)
+			}
+
+			branch := dm.Config.GitHub.Branch
+			if branch == "" {
+				branch = "main"
+			}
+
+			if err := dm.runGitCommand("fetch", "origin", branch); err != nil {
+				return fmt.Errorf("failed to fetch remote branch: %w", err)
+			}
+
+			if err := dm.runGitCommand("checkout", "-b", branch); err != nil {
+				return fmt.Errorf("failed to create local branch %s: %w", branch, err)
+			}
+
+			if err := dm.runGitCommand("merge", "--allow-unrelated-histories", "--no-edit", "origin/"+branch); err != nil {
+				return fmt.Errorf("failed to merge remote branch into local dotfiles: %w", err)
+			}
+
+			fmt.Printf("✓ Successfully initialized and merged %s\n", branch)
 		}
 		return nil
 	}
@@ -2601,13 +2654,6 @@ func (dm *DotfilesManager) deployShellPackageWithOptions(packageDir, homeDir str
 				continue
 			}
 
-			// Remove existing file
-			if _, err := os.Lstat(targetPath); err == nil {
-				if err := os.Remove(targetPath); err != nil {
-					return fmt.Errorf("failed to remove existing %s: %w", targetPath, err)
-				}
-			}
-
 			// Process template with interactive option
 			if err := dm.processTemplateWithOptions(sourcePath, targetPath, interactive); err != nil {
 				return fmt.Errorf("failed to process template %s: %w", fileName, err)
@@ -2657,7 +2703,11 @@ func (dm *DotfilesManager) undeployShellPackage(packageDir, homeDir string, dryR
 	}
 
 	for _, entry := range entries {
-		targetPath := filepath.Join(homeDir, entry.Name())
+		targetName := entry.Name()
+		if strings.HasSuffix(targetName, ".template") {
+			targetName = strings.TrimSuffix(targetName, ".template")
+		}
+		targetPath := filepath.Join(homeDir, targetName)
 
 		if dryRun {
 			fmt.Printf("DRY RUN: Would remove symlink %s\n", targetPath)
@@ -2717,6 +2767,7 @@ Usage:
 
 Commands:
   init                    Initialize configuration by scanning package directories
+  bootstrap <owner/repo> [branch] Configure repo, pull, and deploy on a fresh system
   deploy [packages...]    Deploy packages (default: all for current system)
   undeploy [packages...]  Undeploy packages (default: all for current system)
   status                  Show current status
@@ -2738,6 +2789,7 @@ Options:
 
 Examples:
   dotctl init                      # Initialize config from existing packages
+  dotctl bootstrap user/dotfiles   # Set GitHub repo, pull, and deploy in one step
   dotctl deploy                    # Deploy all packages for current system
   dotctl deploy vim tmux           # Deploy specific packages
   dotctl undeploy shell            # Undeploy specific package
@@ -2954,6 +3006,21 @@ func main() {
 	case "sync":
 		if err := manager.syncToGitHub(dryRun); err != nil {
 			fmt.Printf("Error syncing to GitHub: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "bootstrap":
+		if len(commandArgs) == 0 {
+			fmt.Println("Error: bootstrap command requires a repository (owner/repo)")
+			os.Exit(1)
+		}
+		repository := commandArgs[0]
+		branch := ""
+		if len(commandArgs) > 1 {
+			branch = commandArgs[1]
+		}
+		if err := manager.bootstrapFromGitHub(repository, branch, dryRun, interactive); err != nil {
+			fmt.Printf("Error bootstrapping from GitHub: %v\n", err)
 			os.Exit(1)
 		}
 
