@@ -2221,14 +2221,33 @@ func (dm *DotfilesManager) bootstrapFromGitHub(repository, branch string, dryRun
 			branch = "main"
 		}
 		fmt.Printf("DRY RUN: Would set GitHub repository to %s (branch: %s)\n", repository, branch)
+		fmt.Printf("DRY RUN: Would avoid writing local config before initial pull\n")
 		fmt.Printf("DRY RUN: Would pull dotfiles from GitHub\n")
 		fmt.Printf("DRY RUN: Would reload configuration from pulled repository\n")
 		fmt.Printf("DRY RUN: Would deploy packages for current system (%s)\n", dm.System)
 		return nil
 	}
 
-	if err := dm.setGitHubRepo(repository, branch); err != nil {
-		return fmt.Errorf("failed to save GitHub repository settings: %w", err)
+	if dm.Config.GitHub == nil {
+		dm.Config.GitHub = &GitHubConfig{}
+	}
+	dm.Config.GitHub.Repository = repository
+	if branch != "" {
+		dm.Config.GitHub.Branch = branch
+	} else if dm.Config.GitHub.Branch == "" {
+		dm.Config.GitHub.Branch = "main"
+	}
+
+	gitDir := filepath.Join(dm.DotfilesDir, ".git")
+	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		configPath := filepath.Join(dm.DotfilesDir, "dotctl.yaml")
+		if _, err := os.Stat(configPath); err == nil {
+			backupPath := fmt.Sprintf("%s.bootstrap-backup-%s", configPath, time.Now().Format("20060102150405"))
+			if err := os.Rename(configPath, backupPath); err != nil {
+				return fmt.Errorf("failed to backup local config before bootstrap: %w", err)
+			}
+			fmt.Printf("Backed up local config to %s to avoid pull conflict\n", backupPath)
+		}
 	}
 
 	if err := dm.pullFromGitHub(false); err != nil {
@@ -2240,6 +2259,16 @@ func (dm *DotfilesManager) bootstrapFromGitHub(repository, branch string, dryRun
 		return fmt.Errorf("failed to reload configuration after pull: %w", err)
 	}
 	dm.Config = updatedConfig
+
+	if dm.Config.GitHub == nil || dm.Config.GitHub.Repository == "" {
+		persistBranch := branch
+		if persistBranch == "" {
+			persistBranch = "main"
+		}
+		if err := dm.setGitHubRepo(repository, persistBranch); err != nil {
+			return fmt.Errorf("failed to persist GitHub repository settings: %w", err)
+		}
+	}
 
 	fmt.Printf("Deploying pulled dotfiles for %s...\n", dm.System)
 	dm.deployAllWithOptions(nil, false, interactive)
@@ -2457,43 +2486,37 @@ func (dm *DotfilesManager) pullFromGitHub(dryRun bool) error {
 	// Check if dotfiles directory is a git repository
 	gitDir := filepath.Join(dm.DotfilesDir, ".git")
 	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		branch := dm.Config.GitHub.Branch
+		if branch == "" {
+			branch = "main"
+		}
+		repoURL := fmt.Sprintf("https://github.com/%s.git", dm.Config.GitHub.Repository)
+
 		if dryRun {
-			fmt.Printf("DRY RUN: Would clone repository %s to %s\n", dm.Config.GitHub.Repository, dm.DotfilesDir)
+			fmt.Printf("DRY RUN: Would clone repository %s (branch: %s) to %s\n", dm.Config.GitHub.Repository, branch, dm.DotfilesDir)
 		} else {
-			fmt.Printf("Setting up repository %s...\n", dm.Config.GitHub.Repository)
-			repoURL := fmt.Sprintf("https://github.com/%s.git", dm.Config.GitHub.Repository)
-
-			// Ensure target directory exists for first-time bootstrap.
-			if err := os.MkdirAll(dm.DotfilesDir, 0755); err != nil {
-				return fmt.Errorf("failed to create dotfiles directory: %w", err)
+			entries, readErr := os.ReadDir(dm.DotfilesDir)
+			if readErr != nil {
+				if os.IsNotExist(readErr) {
+					if err := os.MkdirAll(filepath.Dir(dm.DotfilesDir), 0755); err != nil {
+						return fmt.Errorf("failed to create parent directory: %w", err)
+					}
+				} else {
+					return fmt.Errorf("failed to inspect dotfiles directory: %w", readErr)
+				}
 			}
 
-			// Initialize and merge remote branch into existing directory.
-			if err := dm.runGitCommand("init"); err != nil {
-				return fmt.Errorf("failed to initialize git repository: %w", err)
-			}
-			if err := dm.runGitCommand("remote", "add", "origin", repoURL); err != nil {
-				return fmt.Errorf("failed to add remote origin: %w", err)
+			if readErr == nil && len(entries) > 0 {
+				return fmt.Errorf("dotfiles directory '%s' exists and is not a git repository; bootstrap requires an empty directory for first clone. Move files out of the way or use a new --dotfiles-dir", dm.DotfilesDir)
 			}
 
-			branch := dm.Config.GitHub.Branch
-			if branch == "" {
-				branch = "main"
+			fmt.Printf("Cloning repository %s into %s...\n", dm.Config.GitHub.Repository, dm.DotfilesDir)
+			cmd := exec.Command("git", "clone", "--branch", branch, repoURL, dm.DotfilesDir)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("failed to clone repository: %w\nOutput: %s", err, string(output))
 			}
-
-			if err := dm.runGitCommand("fetch", "origin", branch); err != nil {
-				return fmt.Errorf("failed to fetch remote branch: %w", err)
-			}
-
-			if err := dm.runGitCommand("checkout", "-b", branch); err != nil {
-				return fmt.Errorf("failed to create local branch %s: %w", branch, err)
-			}
-
-			if err := dm.runGitCommand("merge", "--allow-unrelated-histories", "--no-edit", "origin/"+branch); err != nil {
-				return fmt.Errorf("failed to merge remote branch into local dotfiles: %w", err)
-			}
-
-			fmt.Printf("✓ Successfully initialized and merged %s\n", branch)
+			fmt.Printf("✓ Successfully cloned %s (%s)\n", dm.Config.GitHub.Repository, branch)
 		}
 		return nil
 	}
