@@ -2659,12 +2659,34 @@ func (dm *DotfilesManager) deployShellPackageWithOptions(packageDir, homeDir str
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue // Skip directories in shell package
-		}
-
 		fileName := entry.Name()
 		sourcePath := filepath.Join(packageDir, fileName)
+		targetPath := filepath.Join(homeDir, fileName)
+
+		if entry.IsDir() {
+			if dryRun {
+				fmt.Printf("DRY RUN: Would create symlink %s -> %s\n", targetPath, sourcePath)
+				continue
+			}
+
+			if _, err := os.Lstat(targetPath); err == nil {
+				if err := os.Remove(targetPath); err != nil {
+					return fmt.Errorf("failed to remove existing %s: %w", targetPath, err)
+				}
+			}
+
+			relativeSourcePath, err := filepath.Rel(homeDir, sourcePath)
+			if err != nil {
+				return fmt.Errorf("failed to calculate relative path: %w", err)
+			}
+
+			if err := os.Symlink(relativeSourcePath, targetPath); err != nil {
+				return fmt.Errorf("failed to create symlink %s -> %s: %w", targetPath, relativeSourcePath, err)
+			}
+
+			fmt.Printf("LINK: %s -> %s\n", targetPath, relativeSourcePath)
+			continue
+		}
 
 		// Check if this is a template file
 		if strings.HasSuffix(fileName, ".template") {
@@ -2740,6 +2762,15 @@ func (dm *DotfilesManager) undeployShellPackage(packageDir, homeDir string, dryR
 		// Check if symlink exists
 		if _, err := os.Lstat(targetPath); os.IsNotExist(err) {
 			continue // Skip if doesn't exist
+		}
+
+		info, err := os.Lstat(targetPath)
+		if err != nil {
+			return fmt.Errorf("failed to inspect %s: %w", targetPath, err)
+		}
+		if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			fmt.Printf("SKIP: %s exists as a real directory (not a symlink)\n", targetPath)
+			continue
 		}
 
 		// Remove the symlink
