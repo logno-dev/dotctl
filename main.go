@@ -2490,8 +2490,6 @@ func (dm *DotfilesManager) pullFromGitHub(dryRun bool) error {
 		if branch == "" {
 			branch = "main"
 		}
-		repoURL := fmt.Sprintf("https://github.com/%s.git", dm.Config.GitHub.Repository)
-
 		if dryRun {
 			fmt.Printf("DRY RUN: Would clone repository %s (branch: %s) to %s\n", dm.Config.GitHub.Repository, branch, dm.DotfilesDir)
 		} else {
@@ -2510,11 +2508,11 @@ func (dm *DotfilesManager) pullFromGitHub(dryRun bool) error {
 				return fmt.Errorf("dotfiles directory '%s' exists and is not a git repository; bootstrap requires an empty directory for first clone. Move files out of the way or use a new --dotfiles-dir", dm.DotfilesDir)
 			}
 
-			fmt.Printf("Cloning repository %s into %s...\n", dm.Config.GitHub.Repository, dm.DotfilesDir)
-			cmd := exec.Command("git", "clone", "--branch", branch, repoURL, dm.DotfilesDir)
+			fmt.Printf("Cloning repository %s into %s with GitHub CLI...\n", dm.Config.GitHub.Repository, dm.DotfilesDir)
+			cmd := exec.Command("gh", "repo", "clone", dm.Config.GitHub.Repository, dm.DotfilesDir, "--", "--branch", branch)
 			output, err := cmd.CombinedOutput()
 			if err != nil {
-				return fmt.Errorf("failed to clone repository: %w\nOutput: %s", err, string(output))
+				return fmt.Errorf("failed to clone repository with gh: %w\nOutput: %s", err, string(output))
 			}
 			fmt.Printf("✓ Successfully cloned %s (%s)\n", dm.Config.GitHub.Repository, branch)
 		}
